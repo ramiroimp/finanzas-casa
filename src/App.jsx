@@ -66,17 +66,20 @@ const peso = (n) => n == null ? "\u2014" :
   new Intl.NumberFormat("es-MX",{style:"currency",currency:"MXN",maximumFractionDigits:0}).format(n);
 const uid = () => Math.random().toString(36).slice(2,9);
 
-function getMondayOf(d = new Date()) {
+function getWeekStartOf(d = new Date()) {
+  // Semana empieza en viernes (dia de pago)
   const date = new Date(d);
-  const day = date.getDay();
-  date.setDate(date.getDate() - (day === 0 ? 6 : day - 1));
+  const day = date.getDay(); // 0=dom,1=lun,...5=vie,6=sab
+  // Retroceder al viernes mas reciente
+  const diff = day >= 5 ? day - 5 : day + 2;
+  date.setDate(date.getDate() - diff);
   return date.toISOString().slice(0,10);
 }
 
-function esSemanaCritica(lunesStr) {
-  const lunes = new Date(lunesStr + "T12:00:00");
+function esSemanaCritica(inicioStr) {
+  const inicio = new Date(inicioStr + "T12:00:00");
   for (let i = 0; i < 7; i++) {
-    const d = new Date(lunes); d.setDate(lunes.getDate() + i);
+    const d = new Date(inicio); d.setDate(inicio.getDate() + i);
     if (d.getDate() === P.hip_dia) return true;
   }
   return false;
@@ -1058,7 +1061,7 @@ export default function App() {
   const totalBanco = ctasBanco.reduce((a, c) => a + (Number(c.saldo) || 0), 0);
   const totalCuentas = cuentas.reduce((a, c) => a + (Number(c.saldo) || 0), 0);
 
-  const hoyLunes = getMondayOf();
+  const hoyInicio = getWeekStartOf();
   const sorted = [...semanas].sort((a,b)=>a.lunes.localeCompare(b.lunes));
 
   const getPrevSaldo = (lunesStr) => {
@@ -1069,8 +1072,8 @@ export default function App() {
   const bufferActual = sorted.length>0 ? sorted[sorted.length-1].saldo_acumulado : P.buffer_inicial;
   const totalDeudaTDC = tarjetas.reduce((a, t) => a + (Number(t.saldo_actual) || 0), 0);
   const patrimonioNeto = totalCuentas - deudas.banorte - deudas.hipoteca - totalDeudaTDC;
-  const semanaHoy = semanas.find(s=>s.lunes===hoyLunes);
-  const critHoy = esSemanaCritica(hoyLunes);
+  const semanaHoy = semanas.find(s=>s.lunes===hoyInicio);
+  const critHoy = esSemanaCritica(hoyInicio);
 
   const totalRecurrentesMes = recurrentes.filter(r => r.activo !== false).reduce((a, r) => a + (Number(r.monto) || 0), 0);
   const totalMSIMes = msiList.filter(m => m.meses_pagados < m.total_meses).reduce((a, m) => a + (Number(m.mensualidad) || 0), 0);
@@ -1088,7 +1091,7 @@ export default function App() {
     setEditSemana(null);
   };
 
-  const abrirSemana = (lunes=hoyLunes) => {
+  const abrirSemana = (lunes=hoyInicio) => {
     setEditSemana(semanas.find(s=>s.lunes===lunes) ?? {lunes});
   };
 
@@ -1268,7 +1271,7 @@ export default function App() {
                 <div>
                   <div style={{fontWeight:700,fontSize:14}}>Esta semana</div>
                   <div style={{fontSize:11,color:C.muted,marginTop:2,textTransform:"capitalize"}}>
-                    {new Date(hoyLunes+"T12:00:00").toLocaleDateString("es-MX",
+                    {new Date(hoyInicio+"T12:00:00").toLocaleDateString("es-MX",
                       {weekday:"long",day:"numeric",month:"long"})}
                   </div>
                 </div>
@@ -1420,7 +1423,7 @@ export default function App() {
             </Card>
 
             {[...Array(10)].map((_,i)=>{
-              const d=new Date(hoyLunes+"T12:00:00");
+              const d=new Date(hoyInicio+"T12:00:00");
               d.setDate(d.getDate()-i*7);
               const lunes=d.toISOString().slice(0,10);
               const reg=semanas.find(s=>s.lunes===lunes);
@@ -1743,7 +1746,7 @@ export default function App() {
             {(() => {
               const weeks = [];
               for (let i = 0; i < 8; i++) {
-                const d = new Date(hoyLunes+"T12:00:00");
+                const d = new Date(hoyInicio+"T12:00:00");
                 d.setDate(d.getDate() + i * 7);
                 const dom = new Date(d);
                 dom.setDate(dom.getDate() + 6);
