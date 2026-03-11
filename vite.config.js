@@ -9,8 +9,8 @@ export default defineConfig({
       registerType: "autoUpdate",
       includeAssets: ["icon-192.png", "icon-512.png", "apple-touch-icon.png"],
       manifest: {
-        name: "Marro Finanzas",
-        short_name: "Marro",
+        name: "Finanzas de la Casa",
+        short_name: "Finanzas",
         description: "Control financiero semanal familiar",
         theme_color: "#080c14",
         background_color: "#080c14",

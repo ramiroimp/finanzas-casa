@@ -501,7 +501,7 @@ export default function App() {
         <div style={{maxWidth:560,margin:"0 auto",padding:"11px 16px",
           display:"flex",alignItems:"center",justifyContent:"space-between"}}>
           <div>
-            <div style={{fontWeight:800,fontSize:14,color:C.goldL,letterSpacing:1}}>MARRO&middot;FINANZAS</div>
+            <div style={{fontWeight:800,fontSize:14,color:C.goldL,letterSpacing:1}}>FINANZAS&middot;CASA</div>
             <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",marginTop:1}}>
               buffer {peso(bufferActual)}
             </div>

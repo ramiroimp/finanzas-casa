@@ -1,5 +1,5 @@
 -- ============================================
--- Marro Finanzas — Supabase Schema
+-- Finanzas de la Casa — Supabase Schema
 -- Correr en: Supabase Dashboard > SQL Editor
 -- ============================================
 
