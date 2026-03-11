@@ -6,6 +6,17 @@ import {
   saveCubetas,
   loadDeudas,
   saveDeudas,
+  loadTarjetas,
+  upsertTarjeta,
+  loadRecurrentes,
+  upsertRecurrente,
+  deleteRecurrente,
+  loadMsi,
+  upsertMsi,
+  deleteMsi,
+  loadGastosPlaneados,
+  upsertGastoPlaneado,
+  deleteGastoPlaneado,
 } from "./supabase";
 
 const P = {
@@ -55,6 +66,14 @@ function esSemanaCritica(lunesStr) {
     if (d.getDate() === P.hip_dia) return true;
   }
   return false;
+}
+
+function diasHasta(dia) {
+  const hoy = new Date();
+  const y = hoy.getFullYear(), m = hoy.getMonth();
+  let f = new Date(y, m, dia);
+  if (f.getTime() <= hoy.getTime()) f = new Date(y, m + 1, dia);
+  return Math.ceil((f - hoy) / 86400000);
 }
 
 function calcSemana(s, prevSaldo) {
@@ -211,6 +230,62 @@ function AddGasto({onAdd, onClose}) {
               style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:10,
                 padding:"9px 10px",color:C.text,outline:"none",width:"100%",fontFamily:"inherit"}}/>
           </div>
+        </div>
+        <Btn onClick={add} full>Agregar &#10003;</Btn>
+      </div>
+    </div>
+  );
+}
+
+function AddGastoPlaneado({onAdd, onClose}) {
+  const [desc, setDesc] = useState("");
+  const [monto, setMonto] = useState("");
+  const [fecha, setFecha] = useState(new Date().toISOString().slice(0,10));
+  const [cat, setCat] = useState("");
+  const add = () => {
+    const n = parseFloat(monto);
+    if (!n || n <= 0 || !desc) return;
+    onAdd({id:uid(), descripcion:desc, monto:n, fecha, categoria:cat, completado:false});
+    onClose();
+  };
+  return (
+    <div style={{position:"fixed",inset:0,background:"#000000cc",display:"flex",
+      alignItems:"flex-end",justifyContent:"center",zIndex:300}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:C.surface,borderRadius:"20px 20px 0 0",padding:22,
+        width:"100%",maxWidth:480,border:`1px solid ${C.border}`}}>
+        <div style={{fontWeight:700,fontSize:16,marginBottom:16}}>Agregar gasto planeado</div>
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Descripcion</div>
+          <input type="text" value={desc} onChange={e=>setDesc(e.target.value)}
+            placeholder="ej. Pago seguro auto..."
+            style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:10,
+              padding:"9px 12px",color:C.text,outline:"none",width:"100%",fontFamily:"inherit"}}/>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+          <div>
+            <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Monto</div>
+            <div style={{display:"flex",background:C.s2,border:`1px solid ${C.border}`,
+              borderRadius:10,overflow:"hidden"}}>
+              <span style={{padding:"0 10px",color:C.muted,fontSize:13,alignSelf:"center"}}>$</span>
+              <input type="number" value={monto} onChange={e=>setMonto(e.target.value)}
+                style={{flex:1,background:"transparent",border:"none",outline:"none",
+                  padding:"9px 4px",color:C.goldL,fontSize:15,fontWeight:700,fontFamily:"monospace"}}/>
+            </div>
+          </div>
+          <div>
+            <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Fecha</div>
+            <input type="date" value={fecha} onChange={e=>setFecha(e.target.value)}
+              style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:10,
+                padding:"9px 10px",color:C.text,outline:"none",width:"100%",fontFamily:"inherit"}}/>
+          </div>
+        </div>
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Categoria (opcional)</div>
+          <input type="text" value={cat} onChange={e=>setCat(e.target.value)}
+            placeholder="ej. auto, salud, viaje..."
+            style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:10,
+              padding:"9px 12px",color:C.text,outline:"none",width:"100%",fontFamily:"inherit"}}/>
         </div>
         <Btn onClick={add} full>Agregar &#10003;</Btn>
       </div>
@@ -438,17 +513,27 @@ export default function App() {
   const [ready, setReady] = useState(false);
   const [editSemana, setEditSemana] = useState(null);
   const [editDeudas, setEditDeudas] = useState(false);
+  const [tarjetas, setTarjetas] = useState([]);
+  const [recurrentes, setRecurrentes] = useState([]);
+  const [msiList, setMsiList] = useState([]);
+  const [gastosPlaneados, setGastosPlaneados] = useState([]);
+  const [expandedTDC, setExpandedTDC] = useState(null);
+  const [showAddPlaneado, setShowAddPlaneado] = useState(false);
+  const [editTDCSaldo, setEditTDCSaldo] = useState(null);
 
   useEffect(()=>{
     (async()=>{
-      const [s, c, d] = await Promise.all([
-        loadSemanas(),
-        loadCubetas(),
-        loadDeudas(),
+      const [s, c, d, t, r, m, gp] = await Promise.all([
+        loadSemanas(), loadCubetas(), loadDeudas(),
+        loadTarjetas(), loadRecurrentes(), loadMsi(), loadGastosPlaneados(),
       ]);
       if(s && s.length > 0) setSemanas(s);
       if(c) setCubetas(c);
       if(d) setDeudas(d);
+      setTarjetas(t||[]);
+      setRecurrentes(r||[]);
+      setMsiList(m||[]);
+      setGastosPlaneados(gp||[]);
       setReady(true);
     })();
   },[]);
@@ -487,12 +572,42 @@ export default function App() {
     setEditSemana(semanas.find(s=>s.lunes===lunes) ?? {lunes});
   };
 
+  const actualizarSaldoTDC = async (id, nuevoSaldo) => {
+    const t = tarjetas.find(x => x.id === id);
+    if (!t) return;
+    const updated = { ...t, saldo_actual: Number(nuevoSaldo) };
+    setTarjetas(prev => prev.map(x => x.id === id ? updated : x));
+    await upsertTarjeta(updated);
+    setEditTDCSaldo(null);
+  };
+
+  const agregarGastoPlaneado = async (g) => {
+    setGastosPlaneados(prev => [...prev, g].sort((a, b) => a.fecha.localeCompare(b.fecha)));
+    await upsertGastoPlaneado(g);
+    setShowAddPlaneado(false);
+  };
+
+  const eliminarGastoPlaneado = async (id) => {
+    setGastosPlaneados(prev => prev.filter(g => g.id !== id));
+    await deleteGastoPlaneado(id);
+  };
+
+  const totalDeudaTDC = tarjetas.reduce((a, t) => a + (Number(t.saldo_actual) || 0), 0);
+  const totalRecurrentesMes = recurrentes.filter(r => r.activo !== false).reduce((a, r) => a + (Number(r.monto) || 0), 0);
+  const totalMSIMes = msiList.filter(m => m.meses_pagados < m.total_meses).reduce((a, m) => a + (Number(m.mensualidad) || 0), 0);
+
   if(!ready) return (
     <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",
       justifyContent:"center",color:C.muted,fontSize:14}}>Cargando...</div>
   );
 
-  const TABS=[{id:"home",label:"Dashboard"},{id:"semana",label:"Semana"},{id:"cubetas",label:"Cubetas"}];
+  const TABS=[
+    {id:"home",label:"Inicio",icon:"\u{1F3E0}"},
+    {id:"semana",label:"Semana",icon:"\u{1F4C5}"},
+    {id:"tarjetas",label:"TDC",icon:"\u{1F4B3}"},
+    {id:"planeacion",label:"Plan",icon:"\u{1F4CA}"},
+    {id:"cubetas",label:"Cubetas",icon:"\u{1FA63}"},
+  ];
 
   return (
     <div style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"system-ui,sans-serif"}}>
@@ -506,15 +621,19 @@ export default function App() {
               buffer {peso(bufferActual)}
             </div>
           </div>
-          <div style={{display:"flex",gap:4}}>
+          <div style={{display:"flex",gap:3}}>
             {TABS.map(t=>(
               <button key={t.id} onClick={()=>setTab(t.id)} style={{
                 background:tab===t.id?`${C.gold}22`:"transparent",
                 border:`1px solid ${tab===t.id?`${C.gold}77`:C.border}`,
                 color:tab===t.id?C.goldL:C.muted,
-                borderRadius:8,padding:"6px 12px",fontSize:12,fontWeight:700,
-                cursor:"pointer",fontFamily:"inherit"
-              }}>{t.label}</button>
+                borderRadius:8,padding:"5px 7px",fontSize:10,fontWeight:700,
+                cursor:"pointer",fontFamily:"inherit",display:"flex",flexDirection:"column",
+                alignItems:"center",gap:1,minWidth:44
+              }}>
+                <span style={{fontSize:14}}>{t.icon}</span>
+                <span>{t.label}</span>
+              </button>
             ))}
           </div>
         </div>
@@ -818,11 +937,344 @@ export default function App() {
             </Card>
           </div>
         )}
+
+        {tab==="tarjetas" && (
+          <div style={{display:"flex",flexDirection:"column",gap:16}}>
+            <div>
+              <div style={{fontWeight:700,fontSize:18}}>Tarjetas de Cr&eacute;dito</div>
+              <div style={{fontSize:12,color:C.muted,marginTop:2}}>
+                Deuda total: <span style={{color:C.red,fontWeight:700}}>{peso(totalDeudaTDC)}</span>
+                <span style={{margin:"0 6px"}}>&middot;</span>
+                Recurrentes: <span style={{color:C.orange,fontWeight:700}}>{peso(totalRecurrentesMes)}</span>/mes
+              </div>
+            </div>
+
+            {tarjetas.map(t => {
+              const uso = t.limite_credito > 0 ? t.saldo_actual / t.limite_credito : 0;
+              const diasCorte = diasHasta(t.fecha_corte);
+              const diasPago = diasHasta(t.fecha_pago);
+              const recTDC = recurrentes.filter(r => r.tarjeta_id === t.id && r.activo !== false);
+              const msiTDC = msiList.filter(m => m.tarjeta_id === t.id && m.meses_pagados < m.total_meses);
+              const expanded = expandedTDC === t.id;
+              const totalRecTDC = recTDC.reduce((a, r) => a + Number(r.monto), 0);
+              return (
+                <div key={t.id} style={{background:C.surface,border:`1px solid ${C.border}`,
+                  borderRadius:16,overflow:"hidden"}}>
+                  <div style={{position:"relative"}}>
+                    <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:t.color}}/>
+                    <div style={{padding:18,cursor:"pointer"}} onClick={()=>setExpandedTDC(expanded?null:t.id)}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                        <div style={{display:"flex",alignItems:"center",gap:8}}>
+                          <span style={{fontSize:20}}>{t.emoji}</span>
+                          <div>
+                            <div style={{fontWeight:700,fontSize:14}}>{t.nombre}</div>
+                            <div style={{fontSize:11,color:C.muted}}>{t.banco} &middot; ****{t.ultimos4}</div>
+                          </div>
+                        </div>
+                        <div style={{textAlign:"right"}}>
+                          {editTDCSaldo===t.id ? (
+                            <div style={{display:"flex",gap:4}} onClick={e=>e.stopPropagation()}>
+                              <input type="number" defaultValue={t.saldo_actual} autoFocus
+                                onKeyDown={e=>{if(e.key==="Enter")actualizarSaldoTDC(t.id,e.target.value)}}
+                                style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:8,
+                                  padding:"4px 8px",color:C.goldL,fontFamily:"monospace",fontSize:13,
+                                  width:100,textAlign:"right",outline:"none"}}/>
+                              <button onClick={()=>setEditTDCSaldo(null)} style={{background:"none",
+                                border:"none",color:C.muted,cursor:"pointer"}}>&#10005;</button>
+                            </div>
+                          ) : (
+                            <div onClick={e=>{e.stopPropagation();setEditTDCSaldo(t.id)}}
+                              style={{cursor:"pointer"}}>
+                              <div style={{fontFamily:"monospace",fontWeight:800,fontSize:18,color:t.color}}>
+                                {peso(t.saldo_actual)}
+                              </div>
+                              {t.limite_credito>0 && (
+                                <div style={{fontSize:10,color:C.muted}}>de {peso(t.limite_credito)}</div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {t.limite_credito > 0 && (
+                        <div style={{marginTop:12}}>
+                          <div style={{background:C.s2,borderRadius:99,height:6,overflow:"hidden"}}>
+                            <div style={{width:`${Math.min(100,uso*100)}%`,height:"100%",
+                              background:uso>0.7?C.red:uso>0.4?C.orange:C.green,
+                              borderRadius:99,transition:"width .5s"}}/>
+                          </div>
+                          <div style={{display:"flex",justifyContent:"space-between",fontSize:10,
+                            color:C.muted,marginTop:4}}>
+                            <span>{(uso*100).toFixed(0)}% utilizado</span>
+                            <span>Disponible {peso(t.limite_credito - t.saldo_actual)}</span>
+                          </div>
+                        </div>
+                      )}
+
+                      <div style={{display:"flex",gap:12,marginTop:12}}>
+                        <div style={{background:C.s2,borderRadius:8,padding:"6px 10px",flex:1,textAlign:"center"}}>
+                          <div style={{fontSize:10,color:C.muted}}>Corte</div>
+                          <div style={{fontSize:12,fontWeight:700,color:diasCorte<=3?C.orange:C.text}}>
+                            D&iacute;a {t.fecha_corte} <span style={{fontSize:10,color:C.muted}}>({diasCorte}d)</span>
+                          </div>
+                        </div>
+                        <div style={{background:C.s2,borderRadius:8,padding:"6px 10px",flex:1,textAlign:"center"}}>
+                          <div style={{fontSize:10,color:C.muted}}>Pago</div>
+                          <div style={{fontSize:12,fontWeight:700,color:diasPago<=5?C.red:C.text}}>
+                            D&iacute;a {t.fecha_pago} <span style={{fontSize:10,color:C.muted}}>({diasPago}d)</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div style={{textAlign:"center",marginTop:10}}>
+                        <span style={{fontSize:11,color:C.muted}}>
+                          {expanded?"\u25B2 Cerrar":"\u25BC Ver detalle"} &middot; {recTDC.length} rec. &middot; {msiTDC.length} MSI
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {expanded && (
+                    <div style={{borderTop:`1px solid ${C.border}`,padding:18}}>
+                      {recTDC.length > 0 && (
+                        <div style={{marginBottom:16}}>
+                          <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
+                            <div style={{fontSize:11,color:C.orange,fontWeight:700,textTransform:"uppercase",
+                              letterSpacing:.5}}>Cargos recurrentes</div>
+                            <span style={{fontSize:11,color:C.muted}}>Total {peso(totalRecTDC)}/mes</span>
+                          </div>
+                          {recTDC.map(r => {
+                            const diasR = r.dia_cargo ? diasHasta(r.dia_cargo) : null;
+                            return (
+                              <div key={r.id} style={{display:"flex",justifyContent:"space-between",
+                                alignItems:"center",padding:"8px 10px",background:C.s2,borderRadius:8,
+                                marginBottom:4}}>
+                                <div>
+                                  <div style={{fontSize:12,fontWeight:500}}>{r.nombre}</div>
+                                  <div style={{fontSize:10,color:C.muted}}>
+                                    D&iacute;a {r.dia_cargo} &middot; {r.categoria||"general"}
+                                    {diasR !== null && diasR <= 7 && (
+                                      <span style={{color:C.gold}}> &middot; en {diasR}d</span>
+                                    )}
+                                  </div>
+                                </div>
+                                <span style={{fontFamily:"monospace",fontWeight:700,fontSize:13,color:C.orange}}>
+                                  {peso(r.monto)}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {msiTDC.length > 0 && (
+                        <div>
+                          <div style={{fontSize:11,color:C.purple,fontWeight:700,textTransform:"uppercase",
+                            letterSpacing:.5,marginBottom:10}}>MSI / Diferidos</div>
+                          {msiTDC.map(m => {
+                            const progreso = m.total_meses > 0 ? m.meses_pagados / m.total_meses : 0;
+                            const restantes = m.total_meses - m.meses_pagados;
+                            return (
+                              <div key={m.id} style={{background:C.s2,borderRadius:10,padding:12,marginBottom:6}}>
+                                <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+                                  <div>
+                                    <div style={{fontSize:12,fontWeight:600}}>{m.descripcion}</div>
+                                    <div style={{fontSize:10,color:C.muted}}>
+                                      {m.con_intereses?`Tasa ${m.tasa_interes}%`:`${m.total_meses} MSI`} &middot; {restantes} meses rest.
+                                    </div>
+                                  </div>
+                                  <div style={{textAlign:"right"}}>
+                                    <div style={{fontFamily:"monospace",fontWeight:700,fontSize:14,color:C.purple}}>
+                                      {peso(m.mensualidad)}<span style={{fontSize:10,color:C.muted}}>/mes</span>
+                                    </div>
+                                    <div style={{fontSize:10,color:C.muted}}>de {peso(m.monto_original)}</div>
+                                  </div>
+                                </div>
+                                <div style={{background:C.surface,borderRadius:99,height:5,overflow:"hidden"}}>
+                                  <div style={{width:`${progreso*100}%`,height:"100%",
+                                    background:m.con_intereses?C.red:C.purple,borderRadius:99,
+                                    transition:"width .5s"}}/>
+                                </div>
+                                <div style={{display:"flex",justifyContent:"space-between",fontSize:10,
+                                  color:C.muted,marginTop:3}}>
+                                  <span>{m.meses_pagados} de {m.total_meses} pagados</span>
+                                  <span>{(progreso*100).toFixed(0)}%</span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {recTDC.length === 0 && msiTDC.length === 0 && (
+                        <div style={{textAlign:"center",padding:16,color:C.muted,fontSize:13}}>
+                          Sin cargos recurrentes ni MSI
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {tarjetas.length > 0 && (
+              <Card>
+                <div style={{fontSize:11,color:C.muted,fontWeight:700,marginBottom:12,
+                  textTransform:"uppercase",letterSpacing:.5}}>Resumen mensual TDC</div>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+                  <span style={{fontSize:13}}>Total recurrentes</span>
+                  <span style={{fontFamily:"monospace",fontWeight:700,color:C.orange}}>{peso(totalRecurrentesMes)}</span>
+                </div>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+                  <span style={{fontSize:13}}>Total MSI / diferidos</span>
+                  <span style={{fontFamily:"monospace",fontWeight:700,color:C.purple}}>{peso(totalMSIMes)}</span>
+                </div>
+                <div style={{borderTop:`1px solid ${C.border}`,paddingTop:8,marginTop:4,
+                  display:"flex",justifyContent:"space-between"}}>
+                  <span style={{fontSize:13,fontWeight:700}}>Total mensual TDC</span>
+                  <span style={{fontFamily:"monospace",fontWeight:800,color:C.red,fontSize:16}}>
+                    {peso(totalRecurrentesMes + totalMSIMes)}
+                  </span>
+                </div>
+              </Card>
+            )}
+          </div>
+        )}
+
+        {tab==="planeacion" && (
+          <div style={{display:"flex",flexDirection:"column",gap:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{fontWeight:700,fontSize:18}}>Planeaci&oacute;n</div>
+                <div style={{fontSize:12,color:C.muted,marginTop:2}}>Pr&oacute;ximas 8 semanas</div>
+              </div>
+              <Btn onClick={()=>setShowAddPlaneado(true)} small>+ Gasto</Btn>
+            </div>
+
+            {(() => {
+              const weeks = [];
+              for (let i = 0; i < 8; i++) {
+                const d = new Date(hoyLunes+"T12:00:00");
+                d.setDate(d.getDate() + i * 7);
+                const dom = new Date(d);
+                dom.setDate(dom.getDate() + 6);
+                weeks.push({
+                  lunes: d.toISOString().slice(0,10),
+                  domingo: dom.toISOString().slice(0,10),
+                  lunesDate: new Date(d),
+                  domingoDate: new Date(dom),
+                });
+              }
+              return weeks.map((w, wi) => {
+                const dias = [];
+                for (let dd = new Date(w.lunesDate); dd <= w.domingoDate; dd = new Date(dd.getFullYear(), dd.getMonth(), dd.getDate()+1)) {
+                  dias.push(dd.getDate());
+                }
+                const recSemana = recurrentes.filter(r => r.activo !== false && dias.includes(r.dia_cargo));
+                const pagosTDC = tarjetas.filter(t => dias.includes(t.fecha_pago));
+                const gpSemana = gastosPlaneados.filter(g => !g.completado && g.fecha >= w.lunes && g.fecha <= w.domingo);
+                const totalRec = recSemana.reduce((a, r) => a + Number(r.monto), 0);
+                const totalGP = gpSemana.reduce((a, g) => a + Number(g.monto), 0);
+                const totalSemana = totalRec + totalGP;
+                const esHoy = wi === 0;
+                return (
+                  <Card key={w.lunes} style={{
+                    padding:16,
+                    borderLeft: esHoy ? `3px solid ${C.gold}` : undefined,
+                  }}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                      <div>
+                        <div style={{fontSize:13,fontWeight:700,textTransform:"capitalize"}}>
+                          {w.lunesDate.toLocaleDateString("es-MX",{day:"numeric",month:"short"})}
+                          {" - "}
+                          {w.domingoDate.toLocaleDateString("es-MX",{day:"numeric",month:"short"})}
+                          {esHoy && <span style={{marginLeft:8,color:C.gold,fontSize:10,fontWeight:600}}>&bull; ESTA SEMANA</span>}
+                        </div>
+                      </div>
+                      {totalSemana > 0 && (
+                        <span style={{fontFamily:"monospace",fontWeight:800,fontSize:14,
+                          color:totalSemana>15000?C.red:C.orange}}>
+                          {peso(totalSemana)}
+                        </span>
+                      )}
+                    </div>
+
+                    {pagosTDC.map(t => (
+                      <div key={`pago-${t.id}`} style={{display:"flex",justifyContent:"space-between",
+                        alignItems:"center",padding:"7px 10px",background:`${C.red}11`,
+                        border:`1px solid ${C.red}22`,borderRadius:8,marginBottom:4}}>
+                        <div style={{display:"flex",alignItems:"center",gap:6}}>
+                          <span>{t.emoji}</span>
+                          <div>
+                            <div style={{fontSize:12,fontWeight:600,color:C.red}}>Pago {t.nombre}</div>
+                            <div style={{fontSize:10,color:C.muted}}>D&iacute;a {t.fecha_pago}</div>
+                          </div>
+                        </div>
+                        <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.red}}>
+                          {peso(t.saldo_actual)}
+                        </span>
+                      </div>
+                    ))}
+
+                    {recSemana.map(r => {
+                      const tdc = tarjetas.find(x => x.id === r.tarjeta_id);
+                      return (
+                        <div key={r.id} style={{display:"flex",justifyContent:"space-between",
+                          alignItems:"center",padding:"7px 10px",background:C.s2,borderRadius:8,
+                          marginBottom:4}}>
+                          <div>
+                            <div style={{fontSize:12,fontWeight:500}}>{r.nombre}</div>
+                            <div style={{fontSize:10,color:C.muted}}>
+                              D&iacute;a {r.dia_cargo} &middot; {tdc?tdc.nombre:""}
+                            </div>
+                          </div>
+                          <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.orange}}>
+                            {peso(r.monto)}
+                          </span>
+                        </div>
+                      );
+                    })}
+
+                    {gpSemana.map(g => (
+                      <div key={g.id} style={{display:"flex",justifyContent:"space-between",
+                        alignItems:"center",padding:"7px 10px",background:`${C.gold}0d`,
+                        border:`1px solid ${C.gold}22`,borderRadius:8,marginBottom:4}}>
+                        <div>
+                          <div style={{fontSize:12,fontWeight:500}}>{g.descripcion}</div>
+                          <div style={{fontSize:10,color:C.muted}}>
+                            {g.fecha} {g.categoria?`\u00b7 ${g.categoria}`:""}
+                          </div>
+                        </div>
+                        <div style={{display:"flex",alignItems:"center",gap:6}}>
+                          <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.goldL}}>
+                            {peso(g.monto)}
+                          </span>
+                          <button onClick={()=>eliminarGastoPlaneado(g.id)}
+                            style={{background:"none",border:"none",color:C.muted,cursor:"pointer",
+                              fontSize:14}}>&#10005;</button>
+                        </div>
+                      </div>
+                    ))}
+
+                    {pagosTDC.length===0 && recSemana.length===0 && gpSemana.length===0 && (
+                      <div style={{textAlign:"center",padding:8,color:C.muted,fontSize:12}}>
+                        Sin eventos esta semana
+                      </div>
+                    )}
+                  </Card>
+                );
+              });
+            })()}
+          </div>
+        )}
       </div>
 
       {editSemana&&(
         <ModalSemana semana={editSemana} prevSaldo={getPrevSaldo(editSemana.lunes)}
           onSave={guardarSemana} onClose={()=>setEditSemana(null)}/>
+      )}
+      {showAddPlaneado && (
+        <AddGastoPlaneado onAdd={agregarGastoPlaneado} onClose={()=>setShowAddPlaneado(false)}/>
       )}
     </div>
   );

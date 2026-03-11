@@ -105,3 +105,83 @@ export async function saveDeudas(deudas) {
   );
   if (error) console.error("saveDeudas error:", error);
 }
+
+// --- Tarjetas ---
+
+export async function loadTarjetas() {
+  const { data, error } = await supabase
+    .from("tarjetas")
+    .select("*")
+    .eq("activa", true)
+    .order("id");
+  if (error) { console.error("loadTarjetas error:", error); return []; }
+  return data || [];
+}
+
+export async function upsertTarjeta(t) {
+  const { error } = await supabase.from("tarjetas").upsert(t, { onConflict: "id" });
+  if (error) console.error("upsertTarjeta error:", error);
+}
+
+// --- Recurrentes ---
+
+export async function loadRecurrentes() {
+  const { data, error } = await supabase
+    .from("recurrentes")
+    .select("*")
+    .order("dia_cargo");
+  if (error) { console.error("loadRecurrentes error:", error); return []; }
+  return data || [];
+}
+
+export async function upsertRecurrente(r) {
+  const { error } = await supabase.from("recurrentes").upsert(r, { onConflict: "id" });
+  if (error) console.error("upsertRecurrente error:", error);
+}
+
+export async function deleteRecurrente(id) {
+  const { error } = await supabase.from("recurrentes").delete().eq("id", id);
+  if (error) console.error("deleteRecurrente error:", error);
+}
+
+// --- MSI ---
+
+export async function loadMsi() {
+  const { data, error } = await supabase
+    .from("msi")
+    .select("*")
+    .order("fecha_inicio");
+  if (error) { console.error("loadMsi error:", error); return []; }
+  return data || [];
+}
+
+export async function upsertMsi(m) {
+  const { error } = await supabase.from("msi").upsert(m, { onConflict: "id" });
+  if (error) console.error("upsertMsi error:", error);
+}
+
+export async function deleteMsi(id) {
+  const { error } = await supabase.from("msi").delete().eq("id", id);
+  if (error) console.error("deleteMsi error:", error);
+}
+
+// --- Gastos Planeados ---
+
+export async function loadGastosPlaneados() {
+  const { data, error } = await supabase
+    .from("gastos_planeados")
+    .select("*")
+    .order("fecha");
+  if (error) { console.error("loadGastosPlaneados error:", error); return []; }
+  return data || [];
+}
+
+export async function upsertGastoPlaneado(g) {
+  const { error } = await supabase.from("gastos_planeados").upsert(g, { onConflict: "id" });
+  if (error) console.error("upsertGastoPlaneado error:", error);
+}
+
+export async function deleteGastoPlaneado(id) {
+  const { error } = await supabase.from("gastos_planeados").delete().eq("id", id);
+  if (error) console.error("deleteGastoPlaneado error:", error);
+}
