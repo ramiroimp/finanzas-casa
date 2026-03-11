@@ -114,9 +114,24 @@ function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiLis
   }
 
   // Prioridad 1: Pagos TDC que vencen esta semana
+  // Pago mensual = recurrentes de esa TDC + MSI activos de esa TDC (NO el saldo total)
   const pagosTDC = tarjetas
-    .filter(t => dias.includes(t.fecha_pago) && t.saldo_actual > 0)
-    .map(t => ({ tipo: "tdc", nombre: `Pago ${t.nombre}`, monto: Number(t.saldo_actual), dia: t.fecha_pago, tarjeta: t }));
+    .filter(t => dias.includes(t.fecha_pago))
+    .map(t => {
+      const recMes = recurrentes
+        .filter(r => r.tarjeta_id === t.id && r.activo !== false)
+        .reduce((sum, r) => sum + Number(r.monto), 0);
+      const msiMes = msiList
+        .filter(m => m.tarjeta_id === t.id && m.meses_pagados < m.total_meses)
+        .reduce((sum, m) => sum + Number(m.mensualidad), 0);
+      const pagoMensual = recMes + msiMes;
+      return {
+        tipo: "tdc", nombre: `Pago ${t.nombre}`, monto: pagoMensual,
+        dia: t.fecha_pago, tarjeta: t,
+        detalle: { recurrentes: recMes, msi: msiMes },
+      };
+    })
+    .filter(p => p.monto > 0);
 
   // Prioridad 2: Obligaciones fijas
   const obligaciones = [];
@@ -305,12 +320,20 @@ function AddGasto({onAdd, onClose, tarjetas, cuentas}) {
   const [desc, setDesc] = useState("");
   const [fuenteTipo, setFuenteTipo] = useState("cuenta");
   const [fuenteId, setFuenteId] = useState("banamex");
+  const [esMSI, setEsMSI] = useState(false);
+  const [msiMeses, setMsiMeses] = useState(6);
   const selCat = CATS.find(c=>c.id===cat);
   useEffect(()=>{ if(selCat?.def>0) setMonto(String(selCat.def)); }, [cat]);
   const add = () => {
     const n = parseFloat(monto);
     if (!n || n <= 0) return;
-    onAdd({id:uid(), cat, desc, monto:n, fecha, fuente_tipo:fuenteTipo, fuente_id:fuenteId});
+    const gastoItem = {id:uid(), cat, desc, monto:n, fecha, fuente_tipo:fuenteTipo, fuente_id:fuenteId};
+    if (esMSI && fuenteTipo === "tdc") {
+      gastoItem.esMSI = true;
+      gastoItem.msiMeses = msiMeses;
+      gastoItem.mensualidad = Math.round((n / msiMeses) * 100) / 100;
+    }
+    onAdd(gastoItem);
     onClose();
   };
   const ctasActivas = cuentas.filter(c => c.tipo !== "cubeta");
@@ -342,6 +365,7 @@ function AddGasto({onAdd, onClose, tarjetas, cuentas}) {
               <button key={o.v} onClick={()=>{
                 setFuenteTipo(o.v);
                 setFuenteId(o.v==="cuenta"?"banamex":(tarjetas[0]?.id||""));
+                if(o.v==="cuenta") setEsMSI(false);
               }} style={{
                 flex:1,background:fuenteTipo===o.v?`${C.gold}22`:C.s2,
                 border:`1px solid ${fuenteTipo===o.v?C.gold:C.border}`,
@@ -358,11 +382,38 @@ function AddGasto({onAdd, onClose, tarjetas, cuentas}) {
               : tarjetas.map(t=><option key={t.id} value={t.id}>{t.emoji} {t.nombre}</option>)
             }
           </select>
+          {fuenteTipo === "tdc" && (
+            <div style={{marginTop:10}}>
+              <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer"}}
+                onClick={()=>setEsMSI(!esMSI)}>
+                <div style={{width:38,height:20,background:esMSI?C.purple:C.border,
+                  borderRadius:99,position:"relative",transition:"background .2s"}}>
+                  <div style={{position:"absolute",top:2,left:esMSI?18:2,width:16,height:16,
+                    background:"white",borderRadius:"50%",transition:"left .2s"}}/>
+                </div>
+                <span style={{fontSize:12,color:esMSI?C.purple:C.muted,fontWeight:600}}>
+                  Meses sin intereses (MSI)
+                </span>
+              </div>
+              {esMSI && (
+                <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+                  {[3,6,9,10,12,18,24].map(n=>(
+                    <button key={n} onClick={()=>setMsiMeses(n)} style={{
+                      background:msiMeses===n?`${C.purple}22`:C.s2,
+                      border:`1px solid ${msiMeses===n?C.purple:C.border}`,
+                      borderRadius:8,padding:"6px 12px",fontSize:12,fontWeight:700,
+                      color:msiMeses===n?C.purple:C.muted,cursor:"pointer",fontFamily:"inherit",
+                    }}>{n}m</button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <div style={{marginBottom:12}}>
           <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>
-            {selCat?.emoji} {selCat?.label} &mdash; Monto
+            {selCat?.emoji} {selCat?.label} &mdash; {esMSI ? `Monto total (${peso(parseFloat(monto)||0)} \u00f7 ${msiMeses} = ${peso(Math.round(((parseFloat(monto)||0)/msiMeses)*100)/100)}/mes)` : "Monto"}
           </div>
           <div style={{display:"flex",background:C.s2,border:`1px solid ${C.border}`,
             borderRadius:10,overflow:"hidden"}}>
@@ -470,10 +521,16 @@ function RecommendationPanel({rec, ingreso}) {
         <div style={{marginBottom:10}}>
           <div style={{fontSize:10,color:C.red,fontWeight:700,marginBottom:6}}>PAGOS TDC (prioridad)</div>
           {rec.pagosTDC.map((p,i)=>(
-            <div key={i} style={{display:"flex",justifyContent:"space-between",marginBottom:4,
-              padding:"6px 10px",background:`${C.red}11`,borderRadius:8}}>
-              <span style={{fontSize:12}}>{p.nombre} (d&iacute;a {p.dia})</span>
-              <span style={{fontFamily:"monospace",fontWeight:700,color:C.red,fontSize:12}}>{peso(p.monto)}</span>
+            <div key={i} style={{padding:"6px 10px",background:`${C.red}11`,borderRadius:8,marginBottom:4}}>
+              <div style={{display:"flex",justifyContent:"space-between"}}>
+                <span style={{fontSize:12}}>{p.nombre} (d&iacute;a {p.dia})</span>
+                <span style={{fontFamily:"monospace",fontWeight:700,color:C.red,fontSize:12}}>{peso(p.monto)}</span>
+              </div>
+              {p.detalle && (
+                <div style={{fontSize:10,color:C.muted,marginTop:2}}>
+                  Rec: {peso(p.detalle.recurrentes)} + MSI: {peso(p.detalle.msi)}
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -561,7 +618,7 @@ function RecommendationPanel({rec, ingreso}) {
   );
 }
 
-function ModalSemana({semana, prevSaldo, onSave, onClose, tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas}) {
+function ModalSemana({semana, prevSaldo, onSave, onClose, tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas, onAddMsi}) {
   const critica = esSemanaCritica(semana.lunes);
   const suraON = semana.lunes <= P.sura_fin;
   const [ramiro, setRamiro] = useState(semana.ramiro ?? 14500);
@@ -766,8 +823,109 @@ function ModalSemana({semana, prevSaldo, onSave, onClose, tarjetas, recurrentes,
         </div>
         <Btn onClick={guardar} full>Guardar semana &#10003;</Btn>
       </div>
-      {showAdd && <AddGasto onAdd={item=>setItems(p=>[...p,item])} onClose={()=>setShowAdd(false)}
-        tarjetas={tarjetas} cuentas={cuentas}/>}
+      {showAdd && <AddGasto onAdd={item=>{
+        setItems(p=>[...p,item]);
+        if (item.esMSI && item.fuente_tipo === "tdc" && onAddMsi) {
+          onAddMsi({
+            id: uid(), tarjeta_id: item.fuente_id,
+            descripcion: item.desc || CATS.find(c=>c.id===item.cat)?.label || "Compra MSI",
+            monto_original: item.monto, mensualidad: item.mensualidad,
+            total_meses: item.msiMeses, meses_pagados: 0,
+            fecha_inicio: item.fecha, con_intereses: false, tasa_interes: 0,
+          });
+        }
+      }} onClose={()=>setShowAdd(false)} tarjetas={tarjetas} cuentas={cuentas}/>}
+    </div>
+  );
+}
+
+function AddEditRecurrente({recurrente, tarjetas, onSave, onClose}) {
+  const isEdit = !!recurrente?.id;
+  const [nombre, setNombre] = useState(recurrente?.nombre || "");
+  const [monto, setMonto] = useState(recurrente?.monto?.toString() || "");
+  const [diaCargo, setDiaCargo] = useState(recurrente?.dia_cargo?.toString() || "");
+  const [tarjetaId, setTarjetaId] = useState(recurrente?.tarjeta_id || tarjetas[0]?.id || "");
+  const [categoria, setCategoria] = useState(recurrente?.categoria || "otro");
+
+  const guardar = () => {
+    const n = parseFloat(monto);
+    if (!nombre || !n || n <= 0) return;
+    onSave({
+      id: recurrente?.id || uid(),
+      nombre, monto: n,
+      dia_cargo: parseInt(diaCargo) || null,
+      tarjeta_id: tarjetaId,
+      categoria, activo: true,
+    });
+    onClose();
+  };
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"#000000cc",display:"flex",
+      alignItems:"flex-end",justifyContent:"center",zIndex:300}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:C.surface,borderRadius:"20px 20px 0 0",padding:22,
+        width:"100%",maxWidth:480,border:`1px solid ${C.border}`,maxHeight:"90vh",overflowY:"auto"}}>
+        <div style={{fontWeight:700,fontSize:16,marginBottom:16}}>
+          {isEdit ? "Editar recurrente" : "Agregar recurrente"}
+        </div>
+
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Nombre</div>
+          <input type="text" value={nombre} onChange={e=>setNombre(e.target.value)}
+            placeholder="ej. Netflix, Gym..."
+            style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:10,
+              padding:"9px 12px",color:C.text,outline:"none",width:"100%",fontFamily:"inherit"}}/>
+        </div>
+
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Tarjeta</div>
+          <select value={tarjetaId} onChange={e=>setTarjetaId(e.target.value)}
+            style={{width:"100%",background:C.s2,border:`1px solid ${C.border}`,borderRadius:8,
+              padding:"9px 10px",color:C.text,outline:"none",fontFamily:"inherit",fontSize:13}}>
+            {tarjetas.map(t=><option key={t.id} value={t.id}>{t.emoji} {t.nombre}</option>)}
+          </select>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+          <div>
+            <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Monto</div>
+            <div style={{display:"flex",background:C.s2,border:`1px solid ${C.border}`,
+              borderRadius:10,overflow:"hidden"}}>
+              <span style={{padding:"0 10px",color:C.muted,fontSize:13,alignSelf:"center"}}>$</span>
+              <input type="number" value={monto} onChange={e=>setMonto(e.target.value)}
+                style={{flex:1,background:"transparent",border:"none",outline:"none",
+                  padding:"9px 4px",color:C.goldL,fontSize:15,fontWeight:700,fontFamily:"monospace"}}/>
+            </div>
+          </div>
+          <div>
+            <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>D&iacute;a de cargo</div>
+            <input type="number" value={diaCargo} onChange={e=>setDiaCargo(e.target.value)}
+              min="1" max="31" placeholder="1-31"
+              style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:10,
+                padding:"9px 12px",color:C.text,outline:"none",width:"100%",fontFamily:"monospace"}}/>
+          </div>
+        </div>
+
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Categor&iacute;a</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:6}}>
+            {CATEGORIAS_GASTO.map(c=>(
+              <button key={c.id} onClick={()=>setCategoria(c.id)} style={{
+                background:categoria===c.id?`${C.gold}22`:C.s2,
+                border:`1px solid ${categoria===c.id?C.gold:C.border}`,
+                borderRadius:10,padding:"7px 3px",cursor:"pointer",
+                display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+                <span style={{fontSize:16}}>{c.emoji}</span>
+                <span style={{fontSize:8,color:categoria===c.id?C.goldL:C.muted,
+                  fontWeight:600,textAlign:"center",fontFamily:"inherit"}}>{c.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <Btn onClick={guardar} full>{isEdit ? "Guardar cambios" : "Agregar"} &#10003;</Btn>
+      </div>
     </div>
   );
 }
@@ -852,6 +1010,7 @@ export default function App() {
   const [expandedTDC, setExpandedTDC] = useState(null);
   const [showAddPlaneado, setShowAddPlaneado] = useState(false);
   const [editTDCSaldo, setEditTDCSaldo] = useState(null);
+  const [editRecurrente, setEditRecurrente] = useState(null);
 
   // Legacy cubetas state for fallback
   const [cubetasLegacy, setCubetasLegacy] = useState(null);
@@ -951,6 +1110,26 @@ export default function App() {
   const eliminarGastoPlaneado = async (id) => {
     setGastosPlaneados(prev => prev.filter(g => g.id !== id));
     await deleteGastoPlaneado(id);
+  };
+
+  const agregarRecurrente = async (r) => {
+    setRecurrentes(prev => [...prev, r].sort((a,b) => (a.dia_cargo||0) - (b.dia_cargo||0)));
+    await upsertRecurrente(r);
+  };
+
+  const editarRecurrente = async (r) => {
+    setRecurrentes(prev => prev.map(x => x.id === r.id ? r : x));
+    await upsertRecurrente(r);
+  };
+
+  const eliminarRecurrente = async (id) => {
+    setRecurrentes(prev => prev.filter(r => r.id !== id));
+    await deleteRecurrente(id);
+  };
+
+  const agregarMsi = async (m) => {
+    setMsiList(prev => [...prev, m]);
+    await upsertMsi(m);
   };
 
   const actualizarSaldoCuenta = async (id, nuevoSaldo) => {
@@ -1423,10 +1602,16 @@ export default function App() {
                     <div style={{borderTop:`1px solid ${C.border}`,padding:18}}>
                       {recTDC.length > 0 && (
                         <div style={{marginBottom:16}}>
-                          <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
+                          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
                             <div style={{fontSize:11,color:C.orange,fontWeight:700,textTransform:"uppercase",
                               letterSpacing:.5}}>Cargos recurrentes</div>
-                            <span style={{fontSize:11,color:C.muted}}>Total {peso(totalRecTDC)}/mes</span>
+                            <div style={{display:"flex",alignItems:"center",gap:8}}>
+                              <span style={{fontSize:11,color:C.muted}}>Total {peso(totalRecTDC)}/mes</span>
+                              <button onClick={(e)=>{e.stopPropagation();setEditRecurrente({tarjeta_id:t.id})}}
+                                style={{background:C.s2,border:`1px solid ${C.border}`,color:C.muted,
+                                  borderRadius:6,padding:"3px 8px",fontSize:11,fontWeight:600,cursor:"pointer",
+                                  fontFamily:"inherit"}}>+ Nuevo</button>
+                            </div>
                           </div>
                           {recTDC.map(r => {
                             const diasR = r.dia_cargo ? diasHasta(r.dia_cargo) : null;
@@ -1434,7 +1619,7 @@ export default function App() {
                               <div key={r.id} style={{display:"flex",justifyContent:"space-between",
                                 alignItems:"center",padding:"8px 10px",background:C.s2,borderRadius:8,
                                 marginBottom:4}}>
-                                <div>
+                                <div style={{flex:1}}>
                                   <div style={{fontSize:12,fontWeight:500}}>{r.nombre}</div>
                                   <div style={{fontSize:10,color:C.muted}}>
                                     D&iacute;a {r.dia_cargo} &middot; {r.categoria||"general"}
@@ -1443,12 +1628,31 @@ export default function App() {
                                     )}
                                   </div>
                                 </div>
-                                <span style={{fontFamily:"monospace",fontWeight:700,fontSize:13,color:C.orange}}>
+                                <span style={{fontFamily:"monospace",fontWeight:700,fontSize:13,color:C.orange,marginRight:8}}>
                                   {peso(r.monto)}
                                 </span>
+                                <button onClick={(e)=>{e.stopPropagation();setEditRecurrente(r)}}
+                                  style={{background:"none",border:"none",color:C.muted,cursor:"pointer",
+                                    fontSize:13,padding:"2px 4px"}}>&#9998;</button>
+                                <button onClick={(e)=>{e.stopPropagation();eliminarRecurrente(r.id)}}
+                                  style={{background:"none",border:"none",color:C.red,cursor:"pointer",
+                                    fontSize:13,padding:"2px 4px"}}>&#10005;</button>
                               </div>
                             );
                           })}
+                        </div>
+                      )}
+                      {recTDC.length === 0 && (
+                        <div style={{marginBottom:16}}>
+                          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                            <div style={{fontSize:11,color:C.orange,fontWeight:700,textTransform:"uppercase",
+                              letterSpacing:.5}}>Cargos recurrentes</div>
+                            <button onClick={(e)=>{e.stopPropagation();setEditRecurrente({tarjeta_id:t.id})}}
+                              style={{background:C.s2,border:`1px solid ${C.border}`,color:C.muted,
+                                borderRadius:6,padding:"3px 8px",fontSize:11,fontWeight:600,cursor:"pointer",
+                                fontFamily:"inherit"}}>+ Nuevo</button>
+                          </div>
+                          <div style={{textAlign:"center",padding:8,color:C.muted,fontSize:12}}>Sin cargos recurrentes</div>
                         </div>
                       )}
 
@@ -1491,9 +1695,9 @@ export default function App() {
                         </div>
                       )}
 
-                      {recTDC.length === 0 && msiTDC.length === 0 && (
-                        <div style={{textAlign:"center",padding:16,color:C.muted,fontSize:13}}>
-                          Sin cargos recurrentes ni MSI
+                      {msiTDC.length === 0 && recTDC.length === 0 && (
+                        <div style={{textAlign:"center",padding:8,color:C.muted,fontSize:12}}>
+                          Sin MSI activos
                         </div>
                       )}
                     </div>
@@ -1556,7 +1760,13 @@ export default function App() {
                   dias.push(dd.getDate());
                 }
                 const recSemana = recurrentes.filter(r => r.activo !== false && dias.includes(r.dia_cargo));
-                const pagosTDC = tarjetas.filter(t => dias.includes(t.fecha_pago));
+                const pagosTDC = tarjetas.filter(t => dias.includes(t.fecha_pago)).map(t => {
+                  const recMes = recurrentes.filter(r => r.tarjeta_id === t.id && r.activo !== false)
+                    .reduce((sum, r) => sum + Number(r.monto), 0);
+                  const msiMes = msiList.filter(m => m.tarjeta_id === t.id && m.meses_pagados < m.total_meses)
+                    .reduce((sum, m) => sum + Number(m.mensualidad), 0);
+                  return { ...t, pagoMensual: recMes + msiMes };
+                });
                 const gpSemana = gastosPlaneados.filter(g => !g.completado && g.fecha >= w.lunes && g.fecha <= w.domingo);
                 const totalRec = recSemana.reduce((a, r) => a + Number(r.monto), 0);
                 const totalGP = gpSemana.reduce((a, g) => a + Number(g.monto), 0);
@@ -1596,7 +1806,7 @@ export default function App() {
                           </div>
                         </div>
                         <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.red}}>
-                          {peso(t.saldo_actual)}
+                          {peso(t.pagoMensual)}
                         </span>
                       </div>
                     ))}
@@ -1607,15 +1817,19 @@ export default function App() {
                         <div key={r.id} style={{display:"flex",justifyContent:"space-between",
                           alignItems:"center",padding:"7px 10px",background:C.s2,borderRadius:8,
                           marginBottom:4}}>
-                          <div>
+                          <div style={{flex:1}}>
                             <div style={{fontSize:12,fontWeight:500}}>{r.nombre}</div>
                             <div style={{fontSize:10,color:C.muted}}>
                               D&iacute;a {r.dia_cargo} &middot; {tdc?tdc.nombre:""}
                             </div>
                           </div>
-                          <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.orange}}>
+                          <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.orange,marginRight:6}}>
                             {peso(r.monto)}
                           </span>
+                          <button onClick={()=>setEditRecurrente(r)}
+                            style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,padding:"2px"}}>&#9998;</button>
+                          <button onClick={()=>eliminarRecurrente(r.id)}
+                            style={{background:"none",border:"none",color:C.red,cursor:"pointer",fontSize:12,padding:"2px"}}>&#10005;</button>
                         </div>
                       );
                     })}
@@ -1664,10 +1878,19 @@ export default function App() {
         <ModalSemana semana={editSemana} prevSaldo={getPrevSaldo(editSemana.lunes)}
           onSave={guardarSemana} onClose={()=>setEditSemana(null)}
           tarjetas={tarjetas} recurrentes={recurrentes} msiList={msiList}
-          gastosPlaneados={gastosPlaneados} cuentas={cuentas} deudas={deudas}/>
+          gastosPlaneados={gastosPlaneados} cuentas={cuentas} deudas={deudas}
+          onAddMsi={agregarMsi}/>
       )}
       {showAddPlaneado && (
         <AddGastoPlaneado onAdd={agregarGastoPlaneado} onClose={()=>setShowAddPlaneado(false)}/>
+      )}
+      {editRecurrente !== null && (
+        <AddEditRecurrente
+          recurrente={editRecurrente.id ? editRecurrente : null}
+          tarjetas={tarjetas}
+          onSave={editRecurrente.id ? editarRecurrente : (r) => agregarRecurrente({...r, tarjeta_id: r.tarjeta_id || editRecurrente.tarjeta_id})}
+          onClose={()=>setEditRecurrente(null)}
+        />
       )}
     </div>
   );
