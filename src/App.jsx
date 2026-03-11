@@ -32,6 +32,22 @@ const CUBETAS_DEF = [
   { id:"acelerador",  nombre:"Mata Banorte / ETF", emoji:"\u{1F525}", meta:836435, color:"#dc2626", pct:20 },
 ];
 
+const CATEGORIAS_GASTO = [
+  {id:"servicio",    label:"Servicio",     emoji:"\u{1F4A1}"},
+  {id:"suscripcion", label:"Suscripci\u00f3n",  emoji:"\u{1F4FA}"},
+  {id:"seguro",      label:"Seguro",       emoji:"\u{1F6E1}\uFE0F"},
+  {id:"salud",       label:"Salud",        emoji:"\u{1F3E5}"},
+  {id:"auto",        label:"Auto",         emoji:"\u{1F697}"},
+  {id:"hogar",       label:"Hogar",        emoji:"\u{1F3E0}"},
+  {id:"educacion",   label:"Educaci\u00f3n",    emoji:"\u{1F393}"},
+  {id:"viaje",       label:"Viaje",        emoji:"\u2708\uFE0F"},
+  {id:"comida",      label:"Comida",       emoji:"\u{1F37D}\uFE0F"},
+  {id:"compras",     label:"Compras",      emoji:"\u{1F6D2}"},
+  {id:"bebe",        label:"Beb\u00e9",         emoji:"\u{1F476}"},
+  {id:"mascota",     label:"Mascota",      emoji:"\u{1F43E}"},
+  {id:"otro",        label:"Otro",         emoji:"\u{1F4CC}"},
+];
+
 const CATS = [
   { id:"agua",      label:"Agua",       emoji:"\u{1F4A7}", def:350  },
   { id:"gas",       label:"Gas",        emoji:"\u{1F525}", def:600  },
@@ -241,7 +257,7 @@ function AddGastoPlaneado({onAdd, onClose}) {
   const [desc, setDesc] = useState("");
   const [monto, setMonto] = useState("");
   const [fecha, setFecha] = useState(new Date().toISOString().slice(0,10));
-  const [cat, setCat] = useState("");
+  const [cat, setCat] = useState("otro");
   const add = () => {
     const n = parseFloat(monto);
     if (!n || n <= 0 || !desc) return;
@@ -253,16 +269,32 @@ function AddGastoPlaneado({onAdd, onClose}) {
       alignItems:"flex-end",justifyContent:"center",zIndex:300}}
       onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div style={{background:C.surface,borderRadius:"20px 20px 0 0",padding:22,
-        width:"100%",maxWidth:480,border:`1px solid ${C.border}`}}>
+        width:"100%",maxWidth:480,border:`1px solid ${C.border}`,maxHeight:"90vh",overflowY:"auto"}}>
         <div style={{fontWeight:700,fontSize:16,marginBottom:16}}>Agregar gasto planeado</div>
         <div style={{marginBottom:12}}>
-          <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Descripcion</div>
+          <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Categor&iacute;a</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:6}}>
+            {CATEGORIAS_GASTO.map(c=>(
+              <button key={c.id} onClick={()=>setCat(c.id)} style={{
+                background:cat===c.id?`${C.gold}22`:C.s2,
+                border:`1px solid ${cat===c.id?C.gold:C.border}`,
+                borderRadius:10,padding:"7px 3px",cursor:"pointer",
+                display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+                <span style={{fontSize:16}}>{c.emoji}</span>
+                <span style={{fontSize:8,color:cat===c.id?C.goldL:C.muted,
+                  fontWeight:600,textAlign:"center",fontFamily:"inherit"}}>{c.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Descripci&oacute;n</div>
           <input type="text" value={desc} onChange={e=>setDesc(e.target.value)}
             placeholder="ej. Pago seguro auto..."
             style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:10,
               padding:"9px 12px",color:C.text,outline:"none",width:"100%",fontFamily:"inherit"}}/>
         </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
           <div>
             <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Monto</div>
             <div style={{display:"flex",background:C.s2,border:`1px solid ${C.border}`,
@@ -279,13 +311,6 @@ function AddGastoPlaneado({onAdd, onClose}) {
               style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:10,
                 padding:"9px 10px",color:C.text,outline:"none",width:"100%",fontFamily:"inherit"}}/>
           </div>
-        </div>
-        <div style={{marginBottom:16}}>
-          <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Categoria (opcional)</div>
-          <input type="text" value={cat} onChange={e=>setCat(e.target.value)}
-            placeholder="ej. auto, salud, viaje..."
-            style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:10,
-              padding:"9px 12px",color:C.text,outline:"none",width:"100%",fontFamily:"inherit"}}/>
         </div>
         <Btn onClick={add} full>Agregar &#10003;</Btn>
       </div>
@@ -1235,14 +1260,19 @@ export default function App() {
                       );
                     })}
 
-                    {gpSemana.map(g => (
+                    {gpSemana.map(g => {
+                      const catInfo = CATEGORIAS_GASTO.find(c=>c.id===g.categoria);
+                      return (
                       <div key={g.id} style={{display:"flex",justifyContent:"space-between",
                         alignItems:"center",padding:"7px 10px",background:`${C.gold}0d`,
                         border:`1px solid ${C.gold}22`,borderRadius:8,marginBottom:4}}>
-                        <div>
-                          <div style={{fontSize:12,fontWeight:500}}>{g.descripcion}</div>
-                          <div style={{fontSize:10,color:C.muted}}>
-                            {g.fecha} {g.categoria?`\u00b7 ${g.categoria}`:""}
+                        <div style={{display:"flex",alignItems:"center",gap:6}}>
+                          {catInfo && <span style={{fontSize:14}}>{catInfo.emoji}</span>}
+                          <div>
+                            <div style={{fontSize:12,fontWeight:500}}>{g.descripcion}</div>
+                            <div style={{fontSize:10,color:C.muted}}>
+                              {g.fecha} {catInfo?`\u00b7 ${catInfo.label}`:""}
+                            </div>
                           </div>
                         </div>
                         <div style={{display:"flex",alignItems:"center",gap:6}}>
@@ -1254,7 +1284,8 @@ export default function App() {
                               fontSize:14}}>&#10005;</button>
                         </div>
                       </div>
-                    ))}
+                      );
+                    })}
 
                     {pagosTDC.length===0 && recSemana.length===0 && gpSemana.length===0 && (
                       <div style={{textAlign:"center",padding:8,color:C.muted,fontSize:12}}>
