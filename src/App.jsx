@@ -17,6 +17,11 @@ import {
   loadGastosPlaneados,
   upsertGastoPlaneado,
   deleteGastoPlaneado,
+  loadCuentas,
+  upsertCuenta,
+  updateSaldoCuenta,
+  loadMovimientos,
+  insertMovimiento,
 } from "./supabase";
 
 const P = {
@@ -24,13 +29,6 @@ const P = {
   banorte_semanal: 5642, sura_semanal: 1200,
   sura_fin: "2026-07-10", hip_mensual: 16149, hip_dia: 3,
 };
-
-const CUBETAS_DEF = [
-  { id:"salud",       nombre:"Fondo de Salud",    emoji:"\u{1F3E5}", meta:600000, color:"#059669", pct:30 },
-  { id:"bebe",        nombre:"Educaci\u00f3n Beb\u00e9",     emoji:"\u{1F476}", meta:300000, color:"#7c3aed", pct:25 },
-  { id:"viajes",      nombre:"Vacaciones / Jap\u00f3n", emoji:"\u2708\uFE0F", meta:200000, color:"#d97706", pct:25 },
-  { id:"acelerador",  nombre:"Mata Banorte / ETF", emoji:"\u{1F525}", meta:836435, color:"#dc2626", pct:20 },
-];
 
 const CATEGORIAS_GASTO = [
   {id:"servicio",    label:"Servicio",     emoji:"\u{1F4A1}"},
@@ -104,6 +102,79 @@ function calcSemana(s, prevSaldo) {
   return { total_ingreso, banorte_pago, hip_pago, items_total, total_salidas, sobrante, saldo, critica };
 }
 
+// --- Motor de Recomendacion ---
+function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas }) {
+  const lunes = new Date(semanaLunes + "T12:00:00");
+  const domingo = new Date(lunes);
+  domingo.setDate(domingo.getDate() + 6);
+
+  const dias = [];
+  for (let d = new Date(lunes); d <= domingo; d.setDate(d.getDate() + 1)) {
+    dias.push(d.getDate());
+  }
+
+  // Prioridad 1: Pagos TDC que vencen esta semana
+  const pagosTDC = tarjetas
+    .filter(t => dias.includes(t.fecha_pago) && t.saldo_actual > 0)
+    .map(t => ({ tipo: "tdc", nombre: `Pago ${t.nombre}`, monto: Number(t.saldo_actual), dia: t.fecha_pago, tarjeta: t }));
+
+  // Prioridad 2: Obligaciones fijas
+  const obligaciones = [];
+  if (dias.includes(P.hip_dia)) {
+    obligaciones.push({ tipo: "fijo", nombre: "Hipoteca Santander", monto: P.hip_mensual, dia: P.hip_dia });
+  }
+  obligaciones.push({ tipo: "fijo", nombre: "Banorte semanal", monto: P.banorte_semanal, dia: null });
+  if (semanaLunes <= P.sura_fin) {
+    obligaciones.push({ tipo: "fijo", nombre: "Sura (Carolina)", monto: P.sura_semanal, dia: null });
+  }
+
+  // Prioridad 3: Gastos planeados en la ventana
+  const gpSemana = gastosPlaneados
+    .filter(g => !g.completado && g.fecha >= semanaLunes && g.fecha <= domingo.toISOString().slice(0,10))
+    .map(g => ({ tipo: "planeado", nombre: g.descripcion, monto: Number(g.monto), dia: null }));
+
+  const totalTDC = pagosTDC.reduce((a, x) => a + x.monto, 0);
+  const totalOblig = obligaciones.reduce((a, x) => a + x.monto, 0);
+  const totalGP = gpSemana.reduce((a, x) => a + x.monto, 0);
+  const totalNecesario = totalTDC + totalOblig + totalGP;
+  const disponible = ingreso - totalNecesario;
+
+  // Distribuir a cubetas
+  const ctasCubeta = cuentas.filter(c => c.tipo === "cubeta" && c.pct_ahorro > 0);
+  const distribucion = ctasCubeta.map(c => ({
+    ...c,
+    monto: disponible > 0 ? disponible * c.pct_ahorro / 100 : 0,
+  }));
+
+  // Sugerencia de retiro si hay deficit
+  let sugerenciaRetiro = [];
+  if (disponible < 0) {
+    const deficit = Math.abs(disponible);
+    const prioRetiro = cuentas
+      .filter(c => c.tipo === "cubeta" && c.saldo > 0)
+      .sort((a, b) => {
+        const orden = { nu_viajes: 1, nu_acelerador: 2, nu_bebe: 3, nu_salud: 4 };
+        return (orden[a.id] || 99) - (orden[b.id] || 99);
+      });
+    let restante = deficit;
+    for (const c of prioRetiro) {
+      if (restante <= 0) break;
+      const retiro = Math.min(c.saldo, restante);
+      sugerenciaRetiro.push({ cuenta: c, monto: retiro });
+      restante -= retiro;
+    }
+  }
+
+  // Info: recurrentes TDC de la semana (no afectan flujo de caja directo)
+  const recSemana = recurrentes.filter(r => r.activo !== false && dias.includes(r.dia_cargo));
+
+  return {
+    pagosTDC, obligaciones, gpSemana,
+    totalTDC, totalOblig, totalGP, totalNecesario,
+    disponible, distribucion, sugerenciaRetiro, recSemana,
+  };
+}
+
 const C = {
   bg:"#080c14", surface:"#0f1623", s2:"#162030", s3:"#1c2a3d",
   border:"#1e2d42", text:"#dde6f5", muted:"#5a7295",
@@ -131,7 +202,8 @@ const Btn = ({children, onClick, color, outline=false, small=false, full=false, 
   );
 };
 
-function CubetaCard({cub, saldo, onDeposit, onWithdraw}) {
+function CubetaCard({cub, onDeposit, onWithdraw}) {
+  const saldo = Number(cub.saldo) || 0;
   const p = cub.meta > 0 ? Math.min(1, saldo / cub.meta) : 0;
   const [mode, setMode] = useState(null);
   const [amt, setAmt] = useState("");
@@ -187,25 +259,67 @@ function CubetaCard({cub, saldo, onDeposit, onWithdraw}) {
   );
 }
 
-function AddGasto({onAdd, onClose}) {
+function CuentaCard({cta, onUpdate}) {
+  const saldo = Number(cta.saldo) || 0;
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState("");
+  return (
+    <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,
+      padding:16,position:"relative",overflow:"hidden"}}>
+      <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:cta.color}}/>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:20}}>{cta.emoji}</span>
+          <div>
+            <div style={{fontWeight:700,fontSize:13}}>{cta.nombre}</div>
+            <div style={{fontSize:10,color:C.muted}}>{cta.banco}{cta.tipo==="reserva"?" \u00b7 Reserva":""}</div>
+          </div>
+        </div>
+        {editing ? (
+          <div style={{display:"flex",gap:4}}>
+            <input autoFocus type="number" value={val} onChange={e=>setVal(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter"){onUpdate(cta.id,Number(val));setEditing(false);}}}
+              style={{background:C.s2,border:`1px solid ${C.border}`,borderRadius:8,
+                padding:"4px 8px",color:C.goldL,fontFamily:"monospace",fontSize:13,
+                width:100,textAlign:"right",outline:"none"}}/>
+            <button onClick={()=>setEditing(false)} style={{background:"none",
+              border:"none",color:C.muted,cursor:"pointer"}}>&#10005;</button>
+          </div>
+        ) : (
+          <div onClick={()=>{setVal(String(saldo));setEditing(true);}}
+            style={{cursor:"pointer",textAlign:"right"}}>
+            <div style={{fontFamily:"monospace",fontWeight:800,fontSize:17,color:cta.color||C.goldL}}>
+              {peso(saldo)}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AddGasto({onAdd, onClose, tarjetas, cuentas}) {
   const [cat, setCat] = useState("super");
   const [monto, setMonto] = useState("");
   const [fecha, setFecha] = useState(new Date().toISOString().slice(0,10));
   const [desc, setDesc] = useState("");
+  const [fuenteTipo, setFuenteTipo] = useState("cuenta");
+  const [fuenteId, setFuenteId] = useState("banamex");
   const selCat = CATS.find(c=>c.id===cat);
   useEffect(()=>{ if(selCat?.def>0) setMonto(String(selCat.def)); }, [cat]);
   const add = () => {
     const n = parseFloat(monto);
     if (!n || n <= 0) return;
-    onAdd({id:uid(), cat, desc, monto:n, fecha});
+    onAdd({id:uid(), cat, desc, monto:n, fecha, fuente_tipo:fuenteTipo, fuente_id:fuenteId});
     onClose();
   };
+  const ctasActivas = cuentas.filter(c => c.tipo !== "cubeta");
   return (
     <div style={{position:"fixed",inset:0,background:"#000000cc",display:"flex",
       alignItems:"flex-end",justifyContent:"center",zIndex:300}}
       onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div style={{background:C.surface,borderRadius:"20px 20px 0 0",padding:22,
-        width:"100%",maxWidth:480,border:`1px solid ${C.border}`}}>
+        width:"100%",maxWidth:480,border:`1px solid ${C.border}`,maxHeight:"90vh",overflowY:"auto"}}>
         <div style={{fontWeight:700,fontSize:16,marginBottom:16}}>Agregar gasto</div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:7,marginBottom:16}}>
           {CATS.map(c=>(
@@ -220,6 +334,32 @@ function AddGasto({onAdd, onClose}) {
             </button>
           ))}
         </div>
+
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>Pagado con</div>
+          <div style={{display:"flex",gap:6,marginBottom:8}}>
+            {[{v:"cuenta",l:"Cuenta"},{v:"tdc",l:"Tarjeta"}].map(o=>(
+              <button key={o.v} onClick={()=>{
+                setFuenteTipo(o.v);
+                setFuenteId(o.v==="cuenta"?"banamex":(tarjetas[0]?.id||""));
+              }} style={{
+                flex:1,background:fuenteTipo===o.v?`${C.gold}22`:C.s2,
+                border:`1px solid ${fuenteTipo===o.v?C.gold:C.border}`,
+                borderRadius:8,padding:"8px",fontSize:12,fontWeight:700,
+                color:fuenteTipo===o.v?C.goldL:C.muted,cursor:"pointer",fontFamily:"inherit",
+              }}>{o.l}</button>
+            ))}
+          </div>
+          <select value={fuenteId} onChange={e=>setFuenteId(e.target.value)}
+            style={{width:"100%",background:C.s2,border:`1px solid ${C.border}`,borderRadius:8,
+              padding:"9px 10px",color:C.text,outline:"none",fontFamily:"inherit",fontSize:13}}>
+            {fuenteTipo==="cuenta"
+              ? ctasActivas.map(c=><option key={c.id} value={c.id}>{c.emoji} {c.nombre}</option>)
+              : tarjetas.map(t=><option key={t.id} value={t.id}>{t.emoji} {t.nombre}</option>)
+            }
+          </select>
+        </div>
+
         <div style={{marginBottom:12}}>
           <div style={{fontSize:11,color:C.muted,marginBottom:5,fontWeight:600}}>
             {selCat?.emoji} {selCat?.label} &mdash; Monto
@@ -318,7 +458,110 @@ function AddGastoPlaneado({onAdd, onClose}) {
   );
 }
 
-function ModalSemana({semana, prevSaldo, onSave, onClose}) {
+function RecommendationPanel({rec, ingreso}) {
+  if (!ingreso || ingreso <= 0) return null;
+  return (
+    <div style={{background:`${C.gold}0d`,border:`1px solid ${C.gold}33`,
+      borderRadius:14,padding:14,marginBottom:14}}>
+      <div style={{fontSize:11,color:C.goldL,fontWeight:700,marginBottom:12,
+        textTransform:"uppercase",letterSpacing:.5}}>&#9889; Recomendaci&oacute;n semanal</div>
+
+      {rec.pagosTDC.length > 0 && (
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:10,color:C.red,fontWeight:700,marginBottom:6}}>PAGOS TDC (prioridad)</div>
+          {rec.pagosTDC.map((p,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",marginBottom:4,
+              padding:"6px 10px",background:`${C.red}11`,borderRadius:8}}>
+              <span style={{fontSize:12}}>{p.nombre} (d&iacute;a {p.dia})</span>
+              <span style={{fontFamily:"monospace",fontWeight:700,color:C.red,fontSize:12}}>{peso(p.monto)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{marginBottom:10}}>
+        <div style={{fontSize:10,color:C.orange,fontWeight:700,marginBottom:6}}>OBLIGACIONES FIJAS</div>
+        {rec.obligaciones.map((o,i)=>(
+          <div key={i} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+            <span style={{fontSize:12}}>{o.nombre}{o.dia?` (d\u00eda ${o.dia})`:""}</span>
+            <span style={{fontFamily:"monospace",fontWeight:700,color:C.orange,fontSize:12}}>{peso(o.monto)}</span>
+          </div>
+        ))}
+      </div>
+
+      {rec.gpSemana.length > 0 && (
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:10,color:C.goldL,fontWeight:700,marginBottom:6}}>GASTOS PLANEADOS</div>
+          {rec.gpSemana.map((g,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+              <span style={{fontSize:12}}>{g.nombre}</span>
+              <span style={{fontFamily:"monospace",fontWeight:700,color:C.goldL,fontSize:12}}>{peso(g.monto)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{borderTop:`1px solid ${C.border}`,paddingTop:8,marginTop:4,marginBottom:8}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+          <span style={{fontSize:12,color:C.muted}}>Total necesario</span>
+          <span style={{fontFamily:"monospace",fontWeight:800,color:C.red,fontSize:13}}>{peso(rec.totalNecesario)}</span>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between"}}>
+          <span style={{fontSize:12,color:C.muted}}>Disponible para cubetas</span>
+          <span style={{fontFamily:"monospace",fontWeight:800,
+            color:rec.disponible>=0?C.green:C.red,fontSize:13}}>
+            {rec.disponible>=0?"+":""}{peso(rec.disponible)}
+          </span>
+        </div>
+      </div>
+
+      {rec.disponible > 0 && rec.distribucion.length > 0 && (
+        <div style={{background:`${C.green}0d`,border:`1px solid ${C.green}22`,borderRadius:10,padding:10,marginBottom:8}}>
+          <div style={{fontSize:10,color:C.green,fontWeight:700,marginBottom:6}}>A CUBETAS NU</div>
+          {rec.distribucion.map(c=>(
+            <div key={c.id} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+              <span style={{fontSize:12}}>{c.emoji} {c.nombre} ({c.pct_ahorro}%)</span>
+              <span style={{fontFamily:"monospace",fontWeight:700,color:c.color,fontSize:12}}>{peso(c.monto)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {rec.disponible < 0 && rec.sugerenciaRetiro.length > 0 && (
+        <div style={{background:`${C.red}11`,border:`1px solid ${C.red}33`,borderRadius:10,padding:10}}>
+          <div style={{fontSize:10,color:C.red,fontWeight:700,marginBottom:6}}>
+            &#9888;&#65039; D&Eacute;FICIT de {peso(Math.abs(rec.disponible))} &mdash; Sugerencia:
+          </div>
+          {rec.sugerenciaRetiro.map((s,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+              <span style={{fontSize:12}}>Retirar de {s.cuenta.emoji} {s.cuenta.nombre}</span>
+              <span style={{fontFamily:"monospace",fontWeight:700,color:C.red,fontSize:12}}>{peso(s.monto)}</span>
+            </div>
+          ))}
+          <div style={{fontSize:10,color:C.muted,marginTop:4}}>
+            Prioridad: Viajes &gt; Acelerador &gt; Beb&eacute; (nunca Salud)
+          </div>
+        </div>
+      )}
+
+      {rec.recSemana.length > 0 && (
+        <div style={{marginTop:8,borderTop:`1px solid ${C.border}`,paddingTop:8}}>
+          <div style={{fontSize:10,color:C.muted,fontWeight:600,marginBottom:4}}>
+            INFO: Recurrentes que se cargan a TDC esta semana
+          </div>
+          {rec.recSemana.map(r=>(
+            <div key={r.id} style={{display:"flex",justifyContent:"space-between",marginBottom:2}}>
+              <span style={{fontSize:11,color:C.muted}}>{r.nombre} (d&iacute;a {r.dia_cargo})</span>
+              <span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{peso(r.monto)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ModalSemana({semana, prevSaldo, onSave, onClose, tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas}) {
   const critica = esSemanaCritica(semana.lunes);
   const suraON = semana.lunes <= P.sura_fin;
   const [ramiro, setRamiro] = useState(semana.ramiro ?? 14500);
@@ -328,13 +571,29 @@ function ModalSemana({semana, prevSaldo, onSave, onClose}) {
   const [nota, setNota] = useState(semana.nota || "");
   const [showAdd, setShowAdd] = useState(false);
   const calc = calcSemana({lunes:semana.lunes,ramiro,carolina,banorte_descontado:banorteDesc,items}, prevSaldo);
-  const dist = CUBETAS_DEF.map(c=>({...c, monto: calc.sobrante>0 ? calc.sobrante*c.pct/100 : 0}));
+
+  const ingreso = calc.total_ingreso;
+  const rec = calcRecomendacion({
+    ingreso, semanaLunes: semana.lunes,
+    tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas,
+  });
+
   const guardar = () => onSave({
     ...semana, ramiro:Number(ramiro), carolina:Number(carolina),
     banorte_descontado:banorteDesc, items, nota,
     sobrante:calc.sobrante, saldo_acumulado:calc.saldo,
   });
   const catLabel = (id) => CATS.find(c=>c.id===id) || {emoji:"\u{1F4CC}",label:"Otro"};
+
+  const getFuenteLabel = (item) => {
+    if (!item.fuente_tipo) return null;
+    if (item.fuente_tipo === "tdc") {
+      const t = tarjetas.find(x => x.id === item.fuente_id);
+      return t ? `${t.emoji} ${t.nombre}` : "TDC";
+    }
+    const c = cuentas.find(x => x.id === item.fuente_id);
+    return c ? `${c.emoji} ${c.nombre}` : "Cuenta";
+  };
 
   return (
     <div style={{position:"fixed",inset:0,background:"#000000cc",zIndex:100,overflowY:"auto",
@@ -455,13 +714,17 @@ function ModalSemana({semana, prevSaldo, onSave, onClose}) {
           )}
           {items.map(item => {
             const c = catLabel(item.cat);
+            const fuente = getFuenteLabel(item);
             return (
               <div key={item.id} style={{display:"flex",alignItems:"center",gap:10,
                 padding:"9px 12px",background:C.s2,borderRadius:10,marginBottom:6}}>
                 <span style={{fontSize:18,width:26}}>{c.emoji}</span>
                 <div style={{flex:1}}>
                   <div style={{fontSize:13,fontWeight:500}}>{c.label}{item.desc?` \u00b7 ${item.desc}`:""}</div>
-                  <div style={{fontSize:11,color:C.muted}}>{item.fecha}</div>
+                  <div style={{fontSize:11,color:C.muted}}>
+                    {item.fecha}
+                    {fuente && <span> &middot; {fuente}</span>}
+                  </div>
                 </div>
                 <span style={{fontFamily:"monospace",fontWeight:700,color:C.red,fontSize:14}}>{peso(item.monto)}</span>
                 <button onClick={()=>setItems(prev=>prev.filter(i=>i.id!==item.id))}
@@ -493,29 +756,7 @@ function ModalSemana({semana, prevSaldo, onSave, onClose}) {
           )}
         </div>
 
-        {calc.sobrante > 0 && (
-          <div style={{background:`${C.gold}0d`,border:`1px solid ${C.gold}33`,
-            borderRadius:14,padding:14,marginBottom:14}}>
-            <div style={{fontSize:11,color:C.goldL,fontWeight:700,marginBottom:10,
-              textTransform:"uppercase",letterSpacing:.5}}>&#9889; Mover a Nu esta semana</div>
-            {dist.map(c=>(
-              <div key={c.id} style={{display:"flex",justifyContent:"space-between",
-                alignItems:"center",marginBottom:7}}>
-                <span style={{fontSize:13}}>{c.emoji} {c.nombre}</span>
-                <span style={{fontFamily:"monospace",fontWeight:800,fontSize:15,color:c.color}}>
-                  {peso(c.monto)}
-                </span>
-              </div>
-            ))}
-            <div style={{borderTop:`1px solid ${C.border}`,marginTop:8,paddingTop:8,
-              display:"flex",justifyContent:"space-between"}}>
-              <span style={{fontSize:12,color:C.muted}}>Total a transferir</span>
-              <span style={{fontFamily:"monospace",fontWeight:800,color:C.goldL,fontSize:15}}>
-                {peso(dist.reduce((a,c)=>a+c.monto,0))}
-              </span>
-            </div>
-          </div>
-        )}
+        <RecommendationPanel rec={rec} ingreso={ingreso} />
 
         <div style={{marginBottom:14}}>
           <input value={nota} onChange={e=>setNota(e.target.value)}
@@ -525,15 +766,81 @@ function ModalSemana({semana, prevSaldo, onSave, onClose}) {
         </div>
         <Btn onClick={guardar} full>Guardar semana &#10003;</Btn>
       </div>
-      {showAdd && <AddGasto onAdd={item=>setItems(p=>[...p,item])} onClose={()=>setShowAdd(false)}/>}
+      {showAdd && <AddGasto onAdd={item=>setItems(p=>[...p,item])} onClose={()=>setShowAdd(false)}
+        tarjetas={tarjetas} cuentas={cuentas}/>}
     </div>
+  );
+}
+
+function TransferPanel({cuentas, onTransfer}) {
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [monto, setMonto] = useState("");
+  const [show, setShow] = useState(false);
+
+  const doTransfer = () => {
+    const n = parseFloat(monto);
+    if (!n || n <= 0 || !from || !to || from === to) return;
+    onTransfer(from, to, n);
+    setMonto(""); setFrom(""); setTo(""); setShow(false);
+  };
+
+  if (!show) {
+    return (
+      <button onClick={()=>setShow(true)} style={{width:"100%",background:C.s2,
+        border:`1px solid ${C.border}`,borderRadius:12,padding:"12px",
+        color:C.muted,fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+        &#8644; Transferir entre cuentas
+      </button>
+    );
+  }
+
+  return (
+    <Card style={{padding:16}}>
+      <div style={{fontSize:11,color:C.goldL,fontWeight:700,marginBottom:12,textTransform:"uppercase",letterSpacing:.5}}>
+        Transferir entre cuentas
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+        <div>
+          <div style={{fontSize:10,color:C.muted,marginBottom:4}}>De</div>
+          <select value={from} onChange={e=>setFrom(e.target.value)}
+            style={{width:"100%",background:C.s2,border:`1px solid ${C.border}`,borderRadius:8,
+              padding:"8px",color:C.text,outline:"none",fontFamily:"inherit",fontSize:12}}>
+            <option value="">Seleccionar...</option>
+            {cuentas.map(c=><option key={c.id} value={c.id}>{c.emoji} {c.nombre}</option>)}
+          </select>
+        </div>
+        <div>
+          <div style={{fontSize:10,color:C.muted,marginBottom:4}}>A</div>
+          <select value={to} onChange={e=>setTo(e.target.value)}
+            style={{width:"100%",background:C.s2,border:`1px solid ${C.border}`,borderRadius:8,
+              padding:"8px",color:C.text,outline:"none",fontFamily:"inherit",fontSize:12}}>
+            <option value="">Seleccionar...</option>
+            {cuentas.map(c=><option key={c.id} value={c.id}>{c.emoji} {c.nombre}</option>)}
+          </select>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <div style={{display:"flex",flex:1,background:C.s2,border:`1px solid ${C.border}`,borderRadius:8,overflow:"hidden"}}>
+          <span style={{padding:"0 8px",color:C.muted,fontSize:13,alignSelf:"center"}}>$</span>
+          <input type="number" value={monto} onChange={e=>setMonto(e.target.value)}
+            onKeyDown={e=>e.key==="Enter"&&doTransfer()}
+            placeholder="Monto"
+            style={{flex:1,background:"transparent",border:"none",outline:"none",
+              padding:"9px 4px",color:C.goldL,fontSize:14,fontWeight:700,fontFamily:"monospace"}}/>
+        </div>
+        <Btn onClick={doTransfer} small>Transferir</Btn>
+        <button onClick={()=>setShow(false)} style={{background:C.s2,color:C.muted,
+          border:`1px solid ${C.border}`,borderRadius:8,padding:"6px 10px",cursor:"pointer"}}>&#10005;</button>
+      </div>
+    </Card>
   );
 }
 
 export default function App() {
   const [tab, setTab] = useState("home");
   const [semanas, setSemanas] = useState([]);
-  const [cubetas, setCubetas] = useState({salud:0,bebe:0,viajes:0,acelerador:0});
+  const [cuentas, setCuentas] = useState([]);
   const [deudas, setDeudas] = useState({banorte:836435,hipoteca:1400898});
   const [ready, setReady] = useState(false);
   const [editSemana, setEditSemana] = useState(null);
@@ -546,25 +853,51 @@ export default function App() {
   const [showAddPlaneado, setShowAddPlaneado] = useState(false);
   const [editTDCSaldo, setEditTDCSaldo] = useState(null);
 
+  // Legacy cubetas state for fallback
+  const [cubetasLegacy, setCubetasLegacy] = useState(null);
+
   useEffect(()=>{
     (async()=>{
-      const [s, c, d, t, r, m, gp] = await Promise.all([
+      const [s, cubLegacy, d, t, r, m, gp, ctas] = await Promise.all([
         loadSemanas(), loadCubetas(), loadDeudas(),
         loadTarjetas(), loadRecurrentes(), loadMsi(), loadGastosPlaneados(),
+        loadCuentas(),
       ]);
       if(s && s.length > 0) setSemanas(s);
-      if(c) setCubetas(c);
+      if(cubLegacy) setCubetasLegacy(cubLegacy);
       if(d) setDeudas(d);
       setTarjetas(t||[]);
       setRecurrentes(r||[]);
       setMsiList(m||[]);
       setGastosPlaneados(gp||[]);
+
+      // Use cuentas if available, otherwise fallback to legacy cubetas
+      if (ctas && ctas.length > 0) {
+        setCuentas(ctas);
+      } else if (cubLegacy) {
+        // Fallback: build virtual cuentas from legacy cubetas
+        const fallbackCubetas = [
+          {id:"nu_salud", nombre:"Fondo de Salud", banco:"Nu", tipo:"cubeta", emoji:"\u{1F3E5}", color:"#059669", saldo:cubLegacy.salud||0, meta:600000, pct_ahorro:30, orden:10},
+          {id:"nu_bebe", nombre:"Educaci\u00f3n Beb\u00e9", banco:"Nu", tipo:"cubeta", emoji:"\u{1F476}", color:"#7c3aed", saldo:cubLegacy.bebe||0, meta:300000, pct_ahorro:25, orden:11},
+          {id:"nu_viajes", nombre:"Vacaciones / Jap\u00f3n", banco:"Nu", tipo:"cubeta", emoji:"\u2708\uFE0F", color:"#d97706", saldo:cubLegacy.viajes||0, meta:200000, pct_ahorro:25, orden:12},
+          {id:"nu_acelerador", nombre:"Mata Banorte / ETF", banco:"Nu", tipo:"cubeta", emoji:"\u{1F525}", color:"#dc2626", saldo:cubLegacy.acelerador||0, meta:836435, pct_ahorro:20, orden:13},
+          {id:"banamex", nombre:"Banamex (principal)", banco:"Banamex", tipo:"ahorro", emoji:"\u{1F3E6}", color:"#2563eb", saldo:88000, meta:0, pct_ahorro:0, orden:1},
+        ];
+        setCuentas(fallbackCubetas);
+      }
       setReady(true);
     })();
   },[]);
 
-  const saveCub = async(v)=>{setCubetas(v); await saveCubetas(v);};
   const saveDeu = async(v)=>{setDeudas(v); await saveDeudas(v);};
+
+  // Derived values from cuentas
+  const ctasCubeta = cuentas.filter(c => c.tipo === "cubeta");
+  const ctasBanco = cuentas.filter(c => c.tipo !== "cubeta");
+  const reservaTDC = cuentas.find(c => c.id === "reserva_tdc");
+  const totalCubetas = ctasCubeta.reduce((a, c) => a + (Number(c.saldo) || 0), 0);
+  const totalBanco = ctasBanco.reduce((a, c) => a + (Number(c.saldo) || 0), 0);
+  const totalCuentas = cuentas.reduce((a, c) => a + (Number(c.saldo) || 0), 0);
 
   const hoyLunes = getMondayOf();
   const sorted = [...semanas].sort((a,b)=>a.lunes.localeCompare(b.lunes));
@@ -575,10 +908,13 @@ export default function App() {
   };
 
   const bufferActual = sorted.length>0 ? sorted[sorted.length-1].saldo_acumulado : P.buffer_inicial;
-  const totalCubetas = Object.values(cubetas).reduce((a,b)=>a+b,0);
-  const patrimonioNeto = bufferActual + totalCubetas - deudas.banorte - deudas.hipoteca;
+  const totalDeudaTDC = tarjetas.reduce((a, t) => a + (Number(t.saldo_actual) || 0), 0);
+  const patrimonioNeto = totalCuentas - deudas.banorte - deudas.hipoteca - totalDeudaTDC;
   const semanaHoy = semanas.find(s=>s.lunes===hoyLunes);
   const critHoy = esSemanaCritica(hoyLunes);
+
+  const totalRecurrentesMes = recurrentes.filter(r => r.activo !== false).reduce((a, r) => a + (Number(r.monto) || 0), 0);
+  const totalMSIMes = msiList.filter(m => m.meses_pagados < m.total_meses).reduce((a, m) => a + (Number(m.mensualidad) || 0), 0);
 
   const guardarSemana = async(s) => {
     const prev = getPrevSaldo(s.lunes);
@@ -617,9 +953,46 @@ export default function App() {
     await deleteGastoPlaneado(id);
   };
 
-  const totalDeudaTDC = tarjetas.reduce((a, t) => a + (Number(t.saldo_actual) || 0), 0);
-  const totalRecurrentesMes = recurrentes.filter(r => r.activo !== false).reduce((a, r) => a + (Number(r.monto) || 0), 0);
-  const totalMSIMes = msiList.filter(m => m.meses_pagados < m.total_meses).reduce((a, m) => a + (Number(m.mensualidad) || 0), 0);
+  const actualizarSaldoCuenta = async (id, nuevoSaldo) => {
+    setCuentas(prev => prev.map(c => c.id === id ? {...c, saldo: Number(nuevoSaldo)} : c));
+    await updateSaldoCuenta(id, Number(nuevoSaldo));
+  };
+
+  const depositarCubeta = async (id, n) => {
+    const cta = cuentas.find(c => c.id === id);
+    if (!cta) return;
+    const nuevoSaldo = (Number(cta.saldo) || 0) + n;
+    setCuentas(prev => prev.map(c => c.id === id ? {...c, saldo: nuevoSaldo} : c));
+    await updateSaldoCuenta(id, nuevoSaldo);
+  };
+
+  const retirarCubeta = async (id, n) => {
+    const cta = cuentas.find(c => c.id === id);
+    if (!cta) return;
+    const nuevoSaldo = Math.max(0, (Number(cta.saldo) || 0) - n);
+    setCuentas(prev => prev.map(c => c.id === id ? {...c, saldo: nuevoSaldo} : c));
+    await updateSaldoCuenta(id, nuevoSaldo);
+  };
+
+  const transferirEntreCuentas = async (fromId, toId, monto) => {
+    const from = cuentas.find(c => c.id === fromId);
+    const to = cuentas.find(c => c.id === toId);
+    if (!from || !to) return;
+    const newFromSaldo = Math.max(0, (Number(from.saldo) || 0) - monto);
+    const newToSaldo = (Number(to.saldo) || 0) + monto;
+    setCuentas(prev => prev.map(c => {
+      if (c.id === fromId) return {...c, saldo: newFromSaldo};
+      if (c.id === toId) return {...c, saldo: newToSaldo};
+      return c;
+    }));
+    await updateSaldoCuenta(fromId, newFromSaldo);
+    await updateSaldoCuenta(toId, newToSaldo);
+    await insertMovimiento({
+      id: uid(), fecha: new Date().toISOString().slice(0,10),
+      tipo: "transferencia", cuenta_origen: fromId, cuenta_destino: toId,
+      monto, descripcion: `${from.nombre} \u2192 ${to.nombre}`,
+    });
+  };
 
   if(!ready) return (
     <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",
@@ -631,7 +1004,7 @@ export default function App() {
     {id:"semana",label:"Semana",icon:"\u{1F4C5}"},
     {id:"tarjetas",label:"TDC",icon:"\u{1F4B3}"},
     {id:"planeacion",label:"Plan",icon:"\u{1F4CA}"},
-    {id:"cubetas",label:"Cubetas",icon:"\u{1FA63}"},
+    {id:"cuentas",label:"Cuentas",icon:"\u{1F4B0}"},
   ];
 
   return (
@@ -643,7 +1016,7 @@ export default function App() {
           <div>
             <div style={{fontWeight:800,fontSize:14,color:C.goldL,letterSpacing:1}}>FINANZAS&middot;CASA</div>
             <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",marginTop:1}}>
-              buffer {peso(bufferActual)}
+              patrimonio {peso(patrimonioNeto)}
             </div>
           </div>
           <div style={{display:"flex",gap:3}}>
@@ -680,14 +1053,29 @@ export default function App() {
                 color:patrimonioNeto>=0?C.goldL:C.red,marginBottom:20}}>
                 {peso(patrimonioNeto)}
               </div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:14}}>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
                 {[
-                  ["&#x1F4B0;","Buffer",bufferActual,bufferActual>=P.minimo_op?C.green:C.red],
-                  ["&#x1FA63;","Cubetas",totalCubetas,C.purple],
-                  ["&#x1F4C9;","Deudas",-deudas.banorte-deudas.hipoteca,C.red],
+                  ["\u{1F3E6}","Cuentas",totalBanco,C.green],
+                  ["\u{1FA63}","Cubetas",totalCubetas,C.purple],
+                  ["\u{1F6E1}\uFE0F","Reserva TDC",reservaTDC?Number(reservaTDC.saldo):0,C.orange],
+                  ["\u{1F4B3}","Deuda TDC",-totalDeudaTDC,C.red],
                 ].map(([e,l,v,c])=>(
                   <div key={l}>
-                    <div style={{fontSize:10,color:C.muted}} dangerouslySetInnerHTML={{__html:`${e} ${l}`}}/>
+                    <div style={{fontSize:10,color:C.muted}}>{e} {l}</div>
+                    <div style={{fontFamily:"monospace",fontWeight:800,fontSize:15,color:c,marginTop:3}}>
+                      {peso(v)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div style={{borderTop:`1px solid ${C.border}`,marginTop:14,paddingTop:10,
+                display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+                {[
+                  ["\u{1F3E0}","Hipoteca",-deudas.hipoteca,"#818cf8"],
+                  ["\u{1F3E6}","Banorte",-deudas.banorte,C.red],
+                ].map(([e,l,v,c])=>(
+                  <div key={l}>
+                    <div style={{fontSize:10,color:C.muted}}>{e} {l}</div>
                     <div style={{fontFamily:"monospace",fontWeight:800,fontSize:15,color:c,marginTop:3}}>
                       {peso(v)}
                     </div>
@@ -728,21 +1116,6 @@ export default function App() {
                       </div>
                     ))}
                   </div>
-                  {semanaHoy.sobrante>0 && (
-                    <div style={{background:`${C.gold}0d`,border:`1px solid ${C.gold}22`,
-                      borderRadius:12,padding:14}}>
-                      <div style={{fontSize:11,color:C.goldL,fontWeight:700,marginBottom:10,
-                        textTransform:"uppercase",letterSpacing:.5}}>&#9889; Mover a Nu hoy</div>
-                      {CUBETAS_DEF.map(c=>(
-                        <div key={c.id} style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
-                          <span style={{fontSize:13}}>{c.emoji} {c.nombre}</span>
-                          <span style={{fontFamily:"monospace",fontWeight:700,color:c.color,fontSize:13}}>
-                            {peso(semanaHoy.sobrante*c.pct/100)}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
                 </>
               ) : (
                 <div style={{textAlign:"center",padding:"16px 0",color:C.muted,fontSize:13}}>
@@ -788,6 +1161,14 @@ export default function App() {
                   </div>
                 );
               })}
+              {totalDeudaTDC > 0 && (
+                <div style={{borderTop:`1px solid ${C.border}`,paddingTop:10,marginTop:4}}>
+                  <div style={{display:"flex",justifyContent:"space-between"}}>
+                    <span style={{fontSize:13,fontWeight:500}}>Deuda TDC total</span>
+                    <span style={{fontFamily:"monospace",fontSize:13,color:C.red,fontWeight:700}}>{peso(totalDeudaTDC)}</span>
+                  </div>
+                </div>
+              )}
             </Card>
 
             {sorted.length>0 && (
@@ -899,67 +1280,46 @@ export default function App() {
           </div>
         )}
 
-        {tab==="cubetas" && (
+        {tab==="cuentas" && (
           <div style={{display:"flex",flexDirection:"column",gap:16}}>
             <div>
-              <div style={{fontWeight:700,fontSize:18}}>Cubetas Nu</div>
+              <div style={{fontWeight:700,fontSize:18}}>Cuentas</div>
               <div style={{fontSize:12,color:C.muted,marginTop:2}}>
-                Total: <span style={{color:C.goldL,fontWeight:700}}>{peso(totalCubetas)}</span>
+                Total: <span style={{color:C.goldL,fontWeight:700}}>{peso(totalCuentas)}</span>
+                <span style={{margin:"0 6px"}}>&middot;</span>
+                Banco: <span style={{color:C.green,fontWeight:700}}>{peso(totalBanco)}</span>
+                <span style={{margin:"0 6px"}}>&middot;</span>
+                Cubetas: <span style={{color:C.purple,fontWeight:700}}>{peso(totalCubetas)}</span>
               </div>
             </div>
 
-            {semanaHoy&&semanaHoy.sobrante>0&&(
-              <div style={{background:`${C.gold}0d`,border:`1px solid ${C.gold}33`,
-                borderRadius:16,padding:18}}>
-                <div style={{fontSize:11,color:C.goldL,fontWeight:700,marginBottom:12,
-                  textTransform:"uppercase",letterSpacing:.5}}>&#9889; Transferir a Nu esta semana</div>
-                {CUBETAS_DEF.map(c=>(
-                  <div key={c.id} style={{display:"flex",justifyContent:"space-between",
-                    alignItems:"center",marginBottom:8}}>
-                    <span style={{fontSize:13}}>{c.emoji} {c.nombre}</span>
-                    <span style={{fontFamily:"monospace",fontWeight:800,fontSize:16,color:c.color}}>
-                      {peso(semanaHoy.sobrante*c.pct/100)}
-                    </span>
-                  </div>
+            {/* Cuentas bancarias */}
+            <div>
+              <div style={{fontSize:11,color:C.goldL,fontWeight:700,marginBottom:10,
+                textTransform:"uppercase",letterSpacing:.5}}>&#x1F3E6; Cuentas bancarias</div>
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {ctasBanco.map(c=>(
+                  <CuentaCard key={c.id} cta={c} onUpdate={actualizarSaldoCuenta}/>
                 ))}
-                <div style={{borderTop:`1px solid ${C.border}`,marginTop:8,paddingTop:8,
-                  display:"flex",justifyContent:"space-between"}}>
-                  <span style={{fontSize:12,color:C.muted}}>Total a transferir</span>
-                  <span style={{fontFamily:"monospace",fontWeight:800,color:C.goldL}}>
-                    {peso(semanaHoy.sobrante)}
-                  </span>
-                </div>
               </div>
-            )}
-
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
-              {CUBETAS_DEF.map(c=>(
-                <CubetaCard key={c.id} cub={c} saldo={cubetas[c.id]||0}
-                  onDeposit={async(id,n)=>await saveCub({...cubetas,[id]:(cubetas[id]||0)+n})}
-                  onWithdraw={async(id,n)=>await saveCub({...cubetas,[id]:Math.max(0,(cubetas[id]||0)-n)})}
-                />
-              ))}
             </div>
 
-            <Card>
-              <div style={{fontSize:11,color:C.muted,fontWeight:700,marginBottom:12,
-                textTransform:"uppercase",letterSpacing:.5}}>&#x1F3E6; Sistema poka-yoke</div>
-              {[
-                {b:"Banorte",r:"Buffer operativo",n:"$109K viven aqu\u00ed. Hipoteca y Banorte domiciliados.",c:C.red},
-                {b:"Nu \u2014 4 Cajas",r:"Cubetas patrimoniales",n:"Una caja por meta. ~14% anual. Fricci\u00f3n = poka-yoke.",c:"#a855f7"},
-                {b:"GNP",r:"Retiro $8,139/mes",n:"Cargo a TDC. Deducible fiscal. No tocar.",c:C.green},
-                {b:"Sura (Carolina)",r:"Ya descontado",n:"Se libera jul-2026. +$1,200/sem a cubetas.",c:C.orange},
-              ].map(x=>(
-                <div key={x.b} style={{display:"flex",marginBottom:10,background:C.s2,
-                  borderRadius:12,padding:"12px 14px",borderLeft:`3px solid ${x.c}`}}>
-                  <div style={{flex:1}}>
-                    <div style={{fontSize:13,fontWeight:700,color:x.c}}>{x.b}</div>
-                    <div style={{fontSize:11,color:C.text,marginTop:1}}>{x.r}</div>
-                    <div style={{fontSize:10,color:C.muted,marginTop:3,lineHeight:1.5}}>{x.n}</div>
-                  </div>
-                </div>
-              ))}
-            </Card>
+            {/* Cubetas Nu */}
+            <div>
+              <div style={{fontSize:11,color:C.purple,fontWeight:700,marginBottom:10,
+                textTransform:"uppercase",letterSpacing:.5}}>&#x1FA63; Cubetas Nu</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+                {ctasCubeta.map(c=>(
+                  <CubetaCard key={c.id} cub={c}
+                    onDeposit={depositarCubeta}
+                    onWithdraw={retirarCubeta}
+                  />
+                ))}
+              </div>
+            </div>
+
+            {/* Transferencias */}
+            <TransferPanel cuentas={cuentas} onTransfer={transferirEntreCuentas}/>
           </div>
         )}
 
@@ -1302,7 +1662,9 @@ export default function App() {
 
       {editSemana&&(
         <ModalSemana semana={editSemana} prevSaldo={getPrevSaldo(editSemana.lunes)}
-          onSave={guardarSemana} onClose={()=>setEditSemana(null)}/>
+          onSave={guardarSemana} onClose={()=>setEditSemana(null)}
+          tarjetas={tarjetas} recurrentes={recurrentes} msiList={msiList}
+          gastosPlaneados={gastosPlaneados} cuentas={cuentas} deudas={deudas}/>
       )}
       {showAddPlaneado && (
         <AddGastoPlaneado onAdd={agregarGastoPlaneado} onClose={()=>setShowAddPlaneado(false)}/>

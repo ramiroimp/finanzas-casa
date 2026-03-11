@@ -185,3 +185,42 @@ export async function deleteGastoPlaneado(id) {
   const { error } = await supabase.from("gastos_planeados").delete().eq("id", id);
   if (error) console.error("deleteGastoPlaneado error:", error);
 }
+
+// --- Cuentas ---
+
+export async function loadCuentas() {
+  const { data, error } = await supabase
+    .from("cuentas")
+    .select("*")
+    .eq("activa", true)
+    .order("orden");
+  if (error) { console.error("loadCuentas error:", error); return []; }
+  return data || [];
+}
+
+export async function upsertCuenta(c) {
+  const { error } = await supabase.from("cuentas").upsert(c, { onConflict: "id" });
+  if (error) console.error("upsertCuenta error:", error);
+}
+
+export async function updateSaldoCuenta(id, saldo) {
+  const { error } = await supabase.from("cuentas").update({ saldo }).eq("id", id);
+  if (error) console.error("updateSaldoCuenta error:", error);
+}
+
+// --- Movimientos ---
+
+export async function loadMovimientos() {
+  const { data, error } = await supabase
+    .from("movimientos")
+    .select("*")
+    .order("fecha", { ascending: false })
+    .limit(50);
+  if (error) { console.error("loadMovimientos error:", error); return []; }
+  return data || [];
+}
+
+export async function insertMovimiento(m) {
+  const { error } = await supabase.from("movimientos").insert(m);
+  if (error) console.error("insertMovimiento error:", error);
+}
