@@ -93,6 +93,25 @@ function diasHasta(dia) {
   return Math.ceil((f - hoy) / 86400000);
 }
 
+// Dado un dia de pago (ej. 30) y el inicio de semana (viernes),
+// devuelve la fecha ISO del viernes en/antes del pago si cae en esa semana, o null.
+function viernesDePago(diaPago, weekStartStr) {
+  const ws = new Date(weekStartStr + "T12:00:00");
+  const we = new Date(ws); we.setDate(we.getDate() + 6);
+  const wsS = ws.toISOString().slice(0,10);
+  const weS = we.toISOString().slice(0,10);
+  const y = ws.getFullYear(), m = ws.getMonth();
+  for (let off = -1; off <= 1; off++) {
+    const fp = new Date(y, m + off, diaPago, 12);
+    const dow = fp.getDay();
+    const diff = dow >= 5 ? dow - 5 : dow + 2;
+    const v = new Date(fp); v.setDate(v.getDate() - diff);
+    const vS = v.toISOString().slice(0,10);
+    if (vS >= wsS && vS <= weS) return vS;
+  }
+  return null;
+}
+
 function calcSemana(s, prevSaldo) {
   const total_ingreso = (Number(s.ramiro)||0) + (Number(s.carolina)||0);
   const critica = esSemanaCritica(s.lunes);
@@ -116,25 +135,27 @@ function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiLis
     dias.push(d.getDate());
   }
 
-  // Prioridad 1: Pagos TDC que vencen esta semana
-  // Pago mensual = recurrentes de esa TDC + MSI activos de esa TDC (NO el saldo total)
+  // Prioridad 1: Pagos TDC — aparecen el viernes antes de la fecha de pago
+  // Pago = pago_pendiente manual (si existe) o recurrentes + MSI activos
   const pagosTDC = tarjetas
-    .filter(t => dias.includes(t.fecha_pago))
     .map(t => {
+      const viernesPago = viernesDePago(t.fecha_pago, semanaLunes);
+      if (!viernesPago) return null;
       const recMes = recurrentes
         .filter(r => r.tarjeta_id === t.id && r.activo !== false)
         .reduce((sum, r) => sum + Number(r.monto), 0);
       const msiMes = msiList
         .filter(m => m.tarjeta_id === t.id && m.meses_pagados < m.total_meses)
         .reduce((sum, m) => sum + Number(m.mensualidad), 0);
-      const pagoMensual = recMes + msiMes;
+      const autoCalc = recMes + msiMes;
+      const pagoMensual = Number(t.pago_pendiente) > 0 ? Number(t.pago_pendiente) : autoCalc;
       return {
         tipo: "tdc", nombre: `Pago ${t.nombre}`, monto: pagoMensual,
-        dia: t.fecha_pago, tarjeta: t,
-        detalle: { recurrentes: recMes, msi: msiMes },
+        dia: t.fecha_pago, viernesPago, tarjeta: t,
+        detalle: { recurrentes: recMes, msi: msiMes, manual: Number(t.pago_pendiente) > 0 },
       };
     })
-    .filter(p => p.monto > 0);
+    .filter(p => p && p.monto > 0);
 
   // Prioridad 2: Obligaciones fijas
   const obligaciones = [];
@@ -526,12 +547,16 @@ function RecommendationPanel({rec, ingreso}) {
           {rec.pagosTDC.map((p,i)=>(
             <div key={i} style={{padding:"6px 10px",background:`${C.red}11`,borderRadius:8,marginBottom:4}}>
               <div style={{display:"flex",justifyContent:"space-between"}}>
-                <span style={{fontSize:12}}>{p.nombre} (d&iacute;a {p.dia})</span>
+                <span style={{fontSize:12}}>{p.nombre} (vence d&iacute;a {p.dia})</span>
                 <span style={{fontFamily:"monospace",fontWeight:700,color:C.red,fontSize:12}}>{peso(p.monto)}</span>
               </div>
               {p.detalle && (
                 <div style={{fontSize:10,color:C.muted,marginTop:2}}>
-                  Rec: {peso(p.detalle.recurrentes)} + MSI: {peso(p.detalle.msi)}
+                  {p.detalle.manual
+                    ? <span style={{color:C.gold}}>Monto manual</span>
+                    : <>Rec: {peso(p.detalle.recurrentes)} + MSI: {peso(p.detalle.msi)}</>
+                  }
+                  {p.viernesPago && <span> &middot; Pagar el {new Date(p.viernesPago+"T12:00:00").toLocaleDateString("es-MX",{day:"numeric",month:"short"})}</span>}
                 </div>
               )}
             </div>
@@ -1104,6 +1129,14 @@ export default function App() {
     setEditTDCSaldo(null);
   };
 
+  const actualizarPagoPendiente = async (id, monto) => {
+    const t = tarjetas.find(x => x.id === id);
+    if (!t) return;
+    const updated = { ...t, pago_pendiente: Number(monto) || 0 };
+    setTarjetas(prev => prev.map(x => x.id === id ? updated : x));
+    await upsertTarjeta(updated);
+  };
+
   const agregarGastoPlaneado = async (g) => {
     setGastosPlaneados(prev => [...prev, g].sort((a, b) => a.fecha.localeCompare(b.fecha)));
     await upsertGastoPlaneado(g);
@@ -1603,6 +1636,31 @@ export default function App() {
 
                   {expanded && (
                     <div style={{borderTop:`1px solid ${C.border}`,padding:18}}>
+                      {/* Pago pendiente manual */}
+                      <div style={{background:`${C.red}0d`,border:`1px solid ${C.red}22`,borderRadius:10,
+                        padding:12,marginBottom:16}}>
+                        <div style={{fontSize:11,color:C.red,fontWeight:700,marginBottom:8,textTransform:"uppercase",
+                          letterSpacing:.5}}>Pago pendiente del corte</div>
+                        <div style={{display:"flex",alignItems:"center",gap:8}}>
+                          <span style={{fontSize:12,color:C.muted}}>$</span>
+                          <input type="number" defaultValue={t.pago_pendiente||""} placeholder="Monto del estado de cuenta"
+                            onBlur={e=>actualizarPagoPendiente(t.id,e.target.value)}
+                            onKeyDown={e=>{if(e.key==="Enter"){actualizarPagoPendiente(t.id,e.target.value);e.target.blur();}}}
+                            style={{flex:1,background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,
+                              padding:"8px 10px",color:C.goldL,fontFamily:"monospace",fontSize:15,fontWeight:700,
+                              outline:"none"}}/>
+                          {Number(t.pago_pendiente)>0 && (
+                            <button onClick={()=>actualizarPagoPendiente(t.id,0)}
+                              style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:14}}>&#10005;</button>
+                          )}
+                        </div>
+                        <div style={{fontSize:10,color:C.muted,marginTop:6}}>
+                          {Number(t.pago_pendiente) > 0
+                            ? <>Monto manual: <span style={{color:C.gold}}>{peso(t.pago_pendiente)}</span> (auto: {peso(totalRecTDC + msiTDC.reduce((a,m)=>a+Number(m.mensualidad),0))})</>
+                            : <>Se usa auto: Rec {peso(totalRecTDC)} + MSI {peso(msiTDC.reduce((a,m)=>a+Number(m.mensualidad),0))} = {peso(totalRecTDC + msiTDC.reduce((a,m)=>a+Number(m.mensualidad),0))}</>
+                          }
+                        </div>
+                      </div>
                       {recTDC.length > 0 && (
                         <div style={{marginBottom:16}}>
                           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
@@ -1763,13 +1821,16 @@ export default function App() {
                   dias.push(dd.getDate());
                 }
                 const recSemana = recurrentes.filter(r => r.activo !== false && dias.includes(r.dia_cargo));
-                const pagosTDC = tarjetas.filter(t => dias.includes(t.fecha_pago)).map(t => {
+                const pagosTDC = tarjetas.map(t => {
+                  const vp = viernesDePago(t.fecha_pago, w.lunes);
+                  if (!vp) return null;
                   const recMes = recurrentes.filter(r => r.tarjeta_id === t.id && r.activo !== false)
                     .reduce((sum, r) => sum + Number(r.monto), 0);
                   const msiMes = msiList.filter(m => m.tarjeta_id === t.id && m.meses_pagados < m.total_meses)
                     .reduce((sum, m) => sum + Number(m.mensualidad), 0);
-                  return { ...t, pagoMensual: recMes + msiMes };
-                });
+                  const autoCalc = recMes + msiMes;
+                  return { ...t, pagoMensual: Number(t.pago_pendiente) > 0 ? Number(t.pago_pendiente) : autoCalc, viernesPago: vp };
+                }).filter(Boolean);
                 const gpSemana = gastosPlaneados.filter(g => !g.completado && g.fecha >= w.lunes && g.fecha <= w.domingo);
                 const totalRec = recSemana.reduce((a, r) => a + Number(r.monto), 0);
                 const totalGP = gpSemana.reduce((a, g) => a + Number(g.monto), 0);
@@ -1805,7 +1866,10 @@ export default function App() {
                           <span>{t.emoji}</span>
                           <div>
                             <div style={{fontSize:12,fontWeight:600,color:C.red}}>Pago {t.nombre}</div>
-                            <div style={{fontSize:10,color:C.muted}}>D&iacute;a {t.fecha_pago}</div>
+                            <div style={{fontSize:10,color:C.muted}}>
+                              Vence d&iacute;a {t.fecha_pago} &middot; Pagar {new Date(t.viernesPago+"T12:00:00").toLocaleDateString("es-MX",{day:"numeric",month:"short"})}
+                              {Number(t.pago_pendiente)>0 && <span style={{color:C.gold}}> (manual)</span>}
+                            </div>
                           </div>
                         </div>
                         <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.red}}>
