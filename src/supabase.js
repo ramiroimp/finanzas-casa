@@ -224,3 +224,21 @@ export async function insertMovimiento(m) {
   const { error } = await supabase.from("movimientos").insert(m);
   if (error) console.error("insertMovimiento error:", error);
 }
+
+// --- Config ---
+
+export async function loadConfig() {
+  const { data, error } = await supabase.from("config").select("*");
+  if (error) { console.error("loadConfig error:", error); return {}; }
+  const cfg = {};
+  (data || []).forEach(row => { cfg[row.clave] = Number(row.valor); });
+  return cfg;
+}
+
+export async function saveConfig(clave, valor) {
+  const { error } = await supabase.from("config").upsert(
+    { clave, valor: Number(valor) },
+    { onConflict: "clave" }
+  );
+  if (error) console.error("saveConfig error:", error);
+}

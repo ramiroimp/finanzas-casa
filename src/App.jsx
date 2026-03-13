@@ -22,6 +22,8 @@ import {
   updateSaldoCuenta,
   loadMovimientos,
   insertMovimiento,
+  loadConfig,
+  saveConfig,
 } from "./supabase";
 
 const P = {
@@ -124,68 +126,77 @@ function calcSemana(s, prevSaldo) {
   return { total_ingreso, banorte_pago, hip_pago, items_total, total_salidas, sobrante, saldo, critica };
 }
 
-// --- Motor de Recomendacion ---
-function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas }) {
+// --- Motor de Recomendacion (Envelope Waterfall) ---
+function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas, config }) {
+  const cfg = config || {};
+  const hipSemanal = cfg.hip_semanal || 4037;
+  const presupuestoDiaADia = cfg.presupuesto_dia_a_dia || 4000;
+
   const lunes = new Date(semanaLunes + "T12:00:00");
   const domingo = new Date(lunes);
   domingo.setDate(domingo.getDate() + 6);
+  const domingoStr = domingo.toISOString().slice(0,10);
 
   const dias = [];
   for (let d = new Date(lunes); d <= domingo; d.setDate(d.getDate() + 1)) {
     dias.push(d.getDate());
   }
 
-  // Prioridad 1: Pagos TDC — aparecen el viernes antes de la fecha de pago
-  // Pago = pago_pendiente manual (si existe) o recurrentes + MSI activos
-  const pagosTDC = tarjetas
-    .map(t => {
-      const viernesPago = viernesDePago(t.fecha_pago, semanaLunes);
-      if (!viernesPago) return null;
-      const recMes = recurrentes
-        .filter(r => r.tarjeta_id === t.id && r.activo !== false)
-        .reduce((sum, r) => sum + Number(r.monto), 0);
-      const msiMes = msiList
-        .filter(m => m.tarjeta_id === t.id && m.meses_pagados < m.total_meses)
-        .reduce((sum, m) => sum + Number(m.mensualidad), 0);
-      const autoCalc = recMes + msiMes;
-      const pagoMensual = Number(t.pago_pendiente) > 0 ? Number(t.pago_pendiente) : autoCalc;
-      return {
-        tipo: "tdc", nombre: `Pago ${t.nombre}`, monto: pagoMensual,
-        dia: t.fecha_pago, viernesPago, tarjeta: t,
-        detalle: { recurrentes: recMes, msi: msiMes, manual: Number(t.pago_pendiente) > 0 },
-      };
-    })
-    .filter(p => p && p.monto > 0);
+  // 1. Pre-deducciones (ya descontadas del cheque)
+  const suraAplica = semanaLunes <= P.sura_fin;
+  const preDeducciones = P.banorte_semanal + (suraAplica ? P.sura_semanal : 0);
+  const ingresoNeto = ingreso - preDeducciones;
 
-  // Prioridad 2: Obligaciones fijas
-  const obligaciones = [];
-  if (dias.includes(P.hip_dia)) {
-    obligaciones.push({ tipo: "fijo", nombre: "Hipoteca Santander", monto: P.hip_mensual, dia: P.hip_dia });
-  }
-  obligaciones.push({ tipo: "fijo", nombre: "Banorte semanal", monto: P.banorte_semanal, dia: null });
-  if (semanaLunes <= P.sura_fin) {
-    obligaciones.push({ tipo: "fijo", nombre: "Sura (Carolina)", monto: P.sura_semanal, dia: null });
-  }
+  // 2. Hipoteca semanal — apartado fijo cada semana
+  const apartadoHipoteca = { monto: hipSemanal };
 
-  // Prioridad 3: Gastos planeados en la ventana
+  // 3. TDC semanal — cada tarjeta ÷ 4
+  const apartadosTDC = tarjetas.map(t => {
+    const recMes = recurrentes
+      .filter(r => r.tarjeta_id === t.id && r.activo !== false)
+      .reduce((sum, r) => sum + Number(r.monto), 0);
+    const msiMes = msiList
+      .filter(m => m.tarjeta_id === t.id && m.meses_pagados < m.total_meses)
+      .reduce((sum, m) => sum + Number(m.mensualidad), 0);
+    const autoCalc = recMes + msiMes;
+    const montoMensual = Number(t.pago_pendiente) > 0 ? Number(t.pago_pendiente) : autoCalc;
+    const montoSemanal = Math.round(montoMensual / 4);
+
+    // Ciclo informativo (sem X/4)
+    const diaCorte = t.fecha_corte || 13;
+    const hoy = new Date(semanaLunes + "T12:00:00");
+    const y = hoy.getFullYear(), m2 = hoy.getMonth();
+    let cycleStart = new Date(y, m2, diaCorte + 1, 12);
+    if (cycleStart > hoy) cycleStart = new Date(y, m2 - 1, diaCorte + 1, 12);
+    const daysElapsed = Math.floor((hoy - cycleStart) / 86400000);
+    const semanaActual = Math.max(1, Math.min(4, Math.floor(daysElapsed / 7) + 1));
+
+    return {
+      tarjeta: t, montoMensual, montoSemanal,
+      semanaActual, totalSemanas: 4,
+      detalle: { recurrentes: recMes, msi: msiMes, manual: Number(t.pago_pendiente) > 0 },
+    };
+  }).filter(a => a.montoMensual > 0);
+
+  // 4. Gastos planeados de esta semana
   const gpSemana = gastosPlaneados
-    .filter(g => !g.completado && g.fecha >= semanaLunes && g.fecha <= domingo.toISOString().slice(0,10))
+    .filter(g => !g.completado && g.fecha >= semanaLunes && g.fecha <= domingoStr)
     .map(g => ({ tipo: "planeado", nombre: g.descripcion, monto: Number(g.monto), dia: null }));
 
-  const totalTDC = pagosTDC.reduce((a, x) => a + x.monto, 0);
-  const totalOblig = obligaciones.reduce((a, x) => a + x.monto, 0);
+  // 5. Totales
+  const totalTDCSemanal = apartadosTDC.reduce((a, x) => a + x.montoSemanal, 0);
   const totalGP = gpSemana.reduce((a, x) => a + x.monto, 0);
-  const totalNecesario = totalTDC + totalOblig + totalGP;
-  const disponible = ingreso - totalNecesario;
+  const totalCompromisos = hipSemanal + totalTDCSemanal + totalGP + presupuestoDiaADia;
+  const disponible = ingresoNeto - totalCompromisos;
 
-  // Distribuir a cubetas
+  // 6. Distribuir a cubetas (solo si hay sobrante)
   const ctasCubeta = cuentas.filter(c => c.tipo === "cubeta" && c.pct_ahorro > 0);
   const distribucion = ctasCubeta.map(c => ({
     ...c,
-    monto: disponible > 0 ? disponible * c.pct_ahorro / 100 : 0,
+    monto: disponible > 0 ? Math.round(disponible * c.pct_ahorro / 100) : 0,
   }));
 
-  // Sugerencia de retiro si hay deficit
+  // 7. Sugerencia de retiro si hay deficit
   let sugerenciaRetiro = [];
   if (disponible < 0) {
     const deficit = Math.abs(disponible);
@@ -204,13 +215,20 @@ function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiLis
     }
   }
 
-  // Info: recurrentes TDC de la semana (no afectan flujo de caja directo)
+  // Info: recurrentes TDC de la semana
   const recSemana = recurrentes.filter(r => r.activo !== false && dias.includes(r.dia_cargo));
 
   return {
-    pagosTDC, obligaciones, gpSemana,
-    totalTDC, totalOblig, totalGP, totalNecesario,
-    disponible, distribucion, sugerenciaRetiro, recSemana,
+    ingresoNeto,
+    apartadoHipoteca,
+    apartadosTDC,
+    gpSemana,
+    presupuestoDiaADia,
+    totalCompromisos,
+    disponible,
+    distribucion,
+    sugerenciaRetiro,
+    recSemana,
   };
 }
 
@@ -533,81 +551,63 @@ function AddGastoPlaneado({onAdd, onClose}) {
   );
 }
 
-function RecommendationPanel({rec, ingreso}) {
-  if (!ingreso || ingreso <= 0) return null;
+function RecommendationPanel({rec}) {
+  if (!rec.ingresoNeto || rec.ingresoNeto <= 0) return null;
+  const Row = ({label, monto, color, sub, bold}) => (
+    <div style={{display:"flex",justifyContent:"space-between",marginBottom:sub?2:4,paddingLeft:sub?12:0}}>
+      <span style={{fontSize:sub?11:12,color:sub?C.muted:C.text}}>{label}</span>
+      <span style={{fontFamily:"monospace",fontWeight:bold?800:700,color:color||C.text,fontSize:sub?11:12}}>{peso(monto)}</span>
+    </div>
+  );
   return (
     <div style={{background:`${C.gold}0d`,border:`1px solid ${C.gold}33`,
       borderRadius:14,padding:14,marginBottom:14}}>
       <div style={{fontSize:11,color:C.goldL,fontWeight:700,marginBottom:12,
-        textTransform:"uppercase",letterSpacing:.5}}>&#9889; Recomendaci&oacute;n semanal</div>
+        textTransform:"uppercase",letterSpacing:.5}}>DISTRIBUCI&Oacute;N SEMANAL</div>
 
-      {rec.pagosTDC.length > 0 && (
-        <div style={{marginBottom:10}}>
-          <div style={{fontSize:10,color:C.red,fontWeight:700,marginBottom:6}}>PAGOS TDC (prioridad)</div>
-          {rec.pagosTDC.map((p,i)=>(
-            <div key={i} style={{padding:"6px 10px",background:`${C.red}11`,borderRadius:8,marginBottom:4}}>
-              <div style={{display:"flex",justifyContent:"space-between"}}>
-                <span style={{fontSize:12}}>{p.nombre} (vence d&iacute;a {p.dia})</span>
-                <span style={{fontFamily:"monospace",fontWeight:700,color:C.red,fontSize:12}}>{peso(p.monto)}</span>
-              </div>
-              {p.detalle && (
-                <div style={{fontSize:10,color:C.muted,marginTop:2}}>
-                  {p.detalle.manual
-                    ? <span style={{color:C.gold}}>Monto manual</span>
-                    : <>Rec: {peso(p.detalle.recurrentes)} + MSI: {peso(p.detalle.msi)}</>
-                  }
-                  {p.viernesPago && <span> &middot; Pagar el {new Date(p.viernesPago+"T12:00:00").toLocaleDateString("es-MX",{day:"numeric",month:"short"})}</span>}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div style={{marginBottom:10}}>
-        <div style={{fontSize:10,color:C.orange,fontWeight:700,marginBottom:6}}>OBLIGACIONES FIJAS</div>
-        {rec.obligaciones.map((o,i)=>(
-          <div key={i} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
-            <span style={{fontSize:12}}>{o.nombre}{o.dia?` (d\u00eda ${o.dia})`:""}</span>
-            <span style={{fontFamily:"monospace",fontWeight:700,color:C.orange,fontSize:12}}>{peso(o.monto)}</span>
-          </div>
-        ))}
+      <Row label="Tu ingreso neto" monto={rec.ingresoNeto} color={C.green} bold />
+      <div style={{fontSize:10,color:C.muted,marginBottom:10,marginTop:-2}}>
+        Banorte y Sura ya descontados
       </div>
 
-      {rec.gpSemana.length > 0 && (
-        <div style={{marginBottom:10}}>
-          <div style={{fontSize:10,color:C.goldL,fontWeight:700,marginBottom:6}}>GASTOS PLANEADOS</div>
-          {rec.gpSemana.map((g,i)=>(
-            <div key={i} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
-              <span style={{fontSize:12}}>{g.nombre}</span>
-              <span style={{fontFamily:"monospace",fontWeight:700,color:C.goldL,fontSize:12}}>{peso(g.monto)}</span>
-            </div>
-          ))}
+      <div style={{fontSize:10,color:C.orange,fontWeight:700,marginBottom:6}}>COMPROMISOS FIJOS</div>
+      <Row label="Hipoteca" monto={rec.apartadoHipoteca.monto} color={C.orange} />
+      {rec.apartadosTDC.map((a,i) => (
+        <div key={i}>
+          <Row label={`Pago ${a.tarjeta.nombre} (sem ${a.semanaActual}/${a.totalSemanas})`}
+            monto={a.montoSemanal} color={C.red} />
+          <div style={{fontSize:10,color:C.muted,marginBottom:4,paddingLeft:12}}>
+            {a.detalle.manual
+              ? <span style={{color:C.gold}}>Manual ({peso(a.montoMensual)}/mes)</span>
+              : <>Rec: {peso(a.detalle.recurrentes)} + MSI: {peso(a.detalle.msi)} = {peso(a.montoMensual)}/mes</>
+            }
+          </div>
         </div>
-      )}
+      ))}
+      {rec.gpSemana.length > 0 && rec.gpSemana.map((g,i) => (
+        <Row key={i} label={g.nombre} monto={g.monto} color={C.goldL} />
+      ))}
 
-      <div style={{borderTop:`1px solid ${C.border}`,paddingTop:8,marginTop:4,marginBottom:8}}>
-        <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
-          <span style={{fontSize:12,color:C.muted}}>Total necesario</span>
-          <span style={{fontFamily:"monospace",fontWeight:800,color:C.red,fontSize:13}}>{peso(rec.totalNecesario)}</span>
-        </div>
-        <div style={{display:"flex",justifyContent:"space-between"}}>
-          <span style={{fontSize:12,color:C.muted}}>Disponible para cubetas</span>
-          <span style={{fontFamily:"monospace",fontWeight:800,
-            color:rec.disponible>=0?C.green:C.red,fontSize:13}}>
-            {rec.disponible>=0?"+":""}{peso(rec.disponible)}
-          </span>
-        </div>
+      <div style={{borderTop:`1px solid ${C.border}`,paddingTop:6,marginTop:6,marginBottom:8}}>
+        <Row label="Subtotal compromisos" monto={rec.totalCompromisos - rec.presupuestoDiaADia} color={C.orange} bold />
+      </div>
+
+      <div style={{marginBottom:8}}>
+        <div style={{fontSize:10,color:C.purple,fontWeight:700,marginBottom:4}}>D&Iacute;A A D&Iacute;A</div>
+        <Row label="Presupuesto semanal" monto={rec.presupuestoDiaADia} color={C.purple} />
+      </div>
+
+      <div style={{borderTop:`1px solid ${C.border}`,paddingTop:8,marginBottom:8}}>
+        <Row label="Sobrante para cubetas" monto={rec.disponible}
+          color={rec.disponible >= 0 ? C.green : C.red} bold />
       </div>
 
       {rec.disponible > 0 && rec.distribucion.length > 0 && (
         <div style={{background:`${C.green}0d`,border:`1px solid ${C.green}22`,borderRadius:10,padding:10,marginBottom:8}}>
-          <div style={{fontSize:10,color:C.green,fontWeight:700,marginBottom:6}}>A CUBETAS NU</div>
-          {rec.distribucion.map(c=>(
-            <div key={c.id} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
-              <span style={{fontSize:12}}>{c.emoji} {c.nombre} ({c.pct_ahorro}%)</span>
-              <span style={{fontFamily:"monospace",fontWeight:700,color:c.color,fontSize:12}}>{peso(c.monto)}</span>
-            </div>
+          <div style={{fontSize:10,color:C.green,fontWeight:700,marginBottom:6}}>A CUBETAS (sobrante)</div>
+          {rec.distribucion.map(c => (
+            <Row key={c.id} label={`${c.emoji} ${c.nombre} (${c.pct_ahorro}%)`}
+              monto={c.monto} color={c.color} />
           ))}
         </div>
       )}
@@ -617,11 +617,9 @@ function RecommendationPanel({rec, ingreso}) {
           <div style={{fontSize:10,color:C.red,fontWeight:700,marginBottom:6}}>
             &#9888;&#65039; D&Eacute;FICIT de {peso(Math.abs(rec.disponible))} &mdash; Sugerencia:
           </div>
-          {rec.sugerenciaRetiro.map((s,i)=>(
-            <div key={i} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
-              <span style={{fontSize:12}}>Retirar de {s.cuenta.emoji} {s.cuenta.nombre}</span>
-              <span style={{fontFamily:"monospace",fontWeight:700,color:C.red,fontSize:12}}>{peso(s.monto)}</span>
-            </div>
+          {rec.sugerenciaRetiro.map((s,i) => (
+            <Row key={i} label={`Retirar de ${s.cuenta.emoji} ${s.cuenta.nombre}`}
+              monto={s.monto} color={C.red} />
           ))}
           <div style={{fontSize:10,color:C.muted,marginTop:4}}>
             Prioridad: Viajes &gt; Acelerador &gt; Beb&eacute; (nunca Salud)
@@ -632,9 +630,9 @@ function RecommendationPanel({rec, ingreso}) {
       {rec.recSemana.length > 0 && (
         <div style={{marginTop:8,borderTop:`1px solid ${C.border}`,paddingTop:8}}>
           <div style={{fontSize:10,color:C.muted,fontWeight:600,marginBottom:4}}>
-            INFO: Recurrentes que se cargan a TDC esta semana
+            Cargos a TDC esta semana
           </div>
-          {rec.recSemana.map(r=>(
+          {rec.recSemana.map(r => (
             <div key={r.id} style={{display:"flex",justifyContent:"space-between",marginBottom:2}}>
               <span style={{fontSize:11,color:C.muted}}>{r.nombre} (d&iacute;a {r.dia_cargo})</span>
               <span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{peso(r.monto)}</span>
@@ -646,7 +644,53 @@ function RecommendationPanel({rec, ingreso}) {
   );
 }
 
-function ModalSemana({semana, prevSaldo, onSave, onClose, tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas, onAddMsi}) {
+function ConfigPanel({config, onUpdate}) {
+  const [editKey, setEditKey] = useState(null);
+  const [editVal, setEditVal] = useState("");
+  const items = [
+    { clave: "hip_semanal", label: "Apartado hipoteca semanal" },
+    { clave: "presupuesto_dia_a_dia", label: "Presupuesto d\u00eda a d\u00eda" },
+  ];
+  const startEdit = (clave) => {
+    setEditKey(clave);
+    setEditVal(String(config[clave] || 0));
+  };
+  const saveEdit = () => {
+    if (editKey && editVal !== "") {
+      onUpdate(editKey, Number(editVal));
+    }
+    setEditKey(null);
+  };
+  return (
+    <Card style={{marginTop:8}}>
+      <div style={{fontSize:11,color:C.muted,fontWeight:700,marginBottom:10,textTransform:"uppercase",letterSpacing:.5}}>
+        &#9881;&#65039; Configuraci&oacute;n
+      </div>
+      {items.map(it => (
+        <div key={it.clave} style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+          <span style={{fontSize:12}}>{it.label}</span>
+          {editKey === it.clave ? (
+            <input value={editVal} onChange={e => setEditVal(e.target.value)}
+              onBlur={saveEdit} onKeyDown={e => e.key === "Enter" && saveEdit()}
+              autoFocus type="number"
+              style={{background:C.s2,border:`1px solid ${C.gold}`,borderRadius:8,
+                padding:"4px 8px",color:C.text,fontFamily:"monospace",fontSize:13,
+                fontWeight:700,width:100,textAlign:"right",outline:"none"}} />
+          ) : (
+            <span onClick={() => startEdit(it.clave)}
+              style={{fontFamily:"monospace",fontWeight:700,fontSize:13,color:C.goldL,
+                cursor:"pointer",padding:"4px 8px",borderRadius:8,
+                background:`${C.gold}0d`}}>
+              {peso(config[it.clave] || 0)}
+            </span>
+          )}
+        </div>
+      ))}
+    </Card>
+  );
+}
+
+function ModalSemana({semana, prevSaldo, onSave, onClose, tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas, onAddMsi, config}) {
   const critica = esSemanaCritica(semana.lunes);
   const suraON = semana.lunes <= P.sura_fin;
   const [ramiro, setRamiro] = useState(semana.ramiro ?? 14500);
@@ -660,7 +704,7 @@ function ModalSemana({semana, prevSaldo, onSave, onClose, tarjetas, recurrentes,
   const ingreso = calc.total_ingreso;
   const rec = calcRecomendacion({
     ingreso, semanaLunes: semana.lunes,
-    tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas,
+    tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas, config,
   });
 
   const guardar = () => onSave({
@@ -841,7 +885,7 @@ function ModalSemana({semana, prevSaldo, onSave, onClose, tarjetas, recurrentes,
           )}
         </div>
 
-        <RecommendationPanel rec={rec} ingreso={ingreso} />
+        <RecommendationPanel rec={rec} />
 
         <div style={{marginBottom:14}}>
           <input value={nota} onChange={e=>setNota(e.target.value)}
@@ -1039,16 +1083,17 @@ export default function App() {
   const [showAddPlaneado, setShowAddPlaneado] = useState(false);
   const [editTDCSaldo, setEditTDCSaldo] = useState(null);
   const [editRecurrente, setEditRecurrente] = useState(null);
+  const [config, setConfig] = useState({ hip_semanal: 4037, presupuesto_dia_a_dia: 4000 });
 
   // Legacy cubetas state for fallback
   const [cubetasLegacy, setCubetasLegacy] = useState(null);
 
   useEffect(()=>{
     (async()=>{
-      const [s, cubLegacy, d, t, r, m, gp, ctas] = await Promise.all([
+      const [s, cubLegacy, d, t, r, m, gp, ctas, cfg] = await Promise.all([
         loadSemanas(), loadCubetas(), loadDeudas(),
         loadTarjetas(), loadRecurrentes(), loadMsi(), loadGastosPlaneados(),
-        loadCuentas(),
+        loadCuentas(), loadConfig(),
       ]);
       if(s && s.length > 0) setSemanas(s);
       if(cubLegacy) setCubetasLegacy(cubLegacy);
@@ -1057,6 +1102,7 @@ export default function App() {
       setRecurrentes(r||[]);
       setMsiList(m||[]);
       setGastosPlaneados(gp||[]);
+      if (cfg && Object.keys(cfg).length > 0) setConfig(prev => ({ ...prev, ...cfg }));
 
       // Use cuentas if available, otherwise fallback to legacy cubetas
       if (ctas && ctas.length > 0) {
@@ -1077,6 +1123,10 @@ export default function App() {
   },[]);
 
   const saveDeu = async(v)=>{setDeudas(v); await saveDeudas(v);};
+  const actualizarConfig = async (clave, valor) => {
+    setConfig(prev => ({ ...prev, [clave]: Number(valor) }));
+    await saveConfig(clave, valor);
+  };
 
   // Derived values from cuentas
   const ctasCubeta = cuentas.filter(c => c.tipo === "cubeta");
@@ -1492,6 +1542,8 @@ export default function App() {
                 </div>
               );
             })}
+
+            <ConfigPanel config={config} onUpdate={actualizarConfig} />
           </div>
         )}
 
@@ -1815,26 +1867,30 @@ export default function App() {
                   domingoDate: new Date(dom),
                 });
               }
+
+              const hipSemanal = config.hip_semanal || 4037;
+              const diaADia = config.presupuesto_dia_a_dia || 4000;
+
               return weeks.map((w, wi) => {
-                const dias = [];
-                for (let dd = new Date(w.lunesDate); dd <= w.domingoDate; dd = new Date(dd.getFullYear(), dd.getMonth(), dd.getDate()+1)) {
-                  dias.push(dd.getDate());
-                }
-                const recSemana = recurrentes.filter(r => r.activo !== false && dias.includes(r.dia_cargo));
-                const pagosTDC = tarjetas.map(t => {
-                  const vp = viernesDePago(t.fecha_pago, w.lunes);
-                  if (!vp) return null;
+                // TDC semanal (÷4 cada tarjeta, misma logica para todas las semanas)
+                const tdcItems = tarjetas.map(t => {
                   const recMes = recurrentes.filter(r => r.tarjeta_id === t.id && r.activo !== false)
                     .reduce((sum, r) => sum + Number(r.monto), 0);
                   const msiMes = msiList.filter(m => m.tarjeta_id === t.id && m.meses_pagados < m.total_meses)
                     .reduce((sum, m) => sum + Number(m.mensualidad), 0);
                   const autoCalc = recMes + msiMes;
-                  return { ...t, pagoMensual: Number(t.pago_pendiente) > 0 ? Number(t.pago_pendiente) : autoCalc, viernesPago: vp };
-                }).filter(Boolean);
+                  const montoMensual = Number(t.pago_pendiente) > 0 ? Number(t.pago_pendiente) : autoCalc;
+                  return { tarjeta: t, montoMensual, montoSemanal: Math.round(montoMensual / 4) };
+                }).filter(x => x.montoMensual > 0);
+
+                // Gastos planeados de esta semana
                 const gpSemana = gastosPlaneados.filter(g => !g.completado && g.fecha >= w.lunes && g.fecha <= w.domingo);
-                const totalRec = recSemana.reduce((a, r) => a + Number(r.monto), 0);
                 const totalGP = gpSemana.reduce((a, g) => a + Number(g.monto), 0);
-                const totalSemana = totalRec + totalGP;
+
+                // Total compromisos
+                const totalTDCSem = tdcItems.reduce((a, x) => a + x.montoSemanal, 0);
+                const totalCompromisos = hipSemanal + totalTDCSem + totalGP + diaADia;
+
                 const esHoy = wi === 0;
                 return (
                   <Card key={w.lunes} style={{
@@ -1850,56 +1906,23 @@ export default function App() {
                           {esHoy && <span style={{marginLeft:8,color:C.gold,fontSize:10,fontWeight:600}}>&bull; ESTA SEMANA</span>}
                         </div>
                       </div>
-                      {totalSemana > 0 && (
-                        <span style={{fontFamily:"monospace",fontWeight:800,fontSize:14,
-                          color:totalSemana>15000?C.red:C.orange}}>
-                          {peso(totalSemana)}
-                        </span>
-                      )}
+                      <span style={{fontFamily:"monospace",fontWeight:800,fontSize:14,
+                        color:totalCompromisos>20000?C.red:C.orange}}>
+                        {peso(totalCompromisos)}
+                      </span>
                     </div>
 
-                    {pagosTDC.map(t => (
-                      <div key={`pago-${t.id}`} style={{display:"flex",justifyContent:"space-between",
-                        alignItems:"center",padding:"7px 10px",background:`${C.red}11`,
-                        border:`1px solid ${C.red}22`,borderRadius:8,marginBottom:4}}>
-                        <div style={{display:"flex",alignItems:"center",gap:6}}>
-                          <span>{t.emoji}</span>
-                          <div>
-                            <div style={{fontSize:12,fontWeight:600,color:C.red}}>Pago {t.nombre}</div>
-                            <div style={{fontSize:10,color:C.muted}}>
-                              Vence d&iacute;a {t.fecha_pago} &middot; Pagar {new Date(t.viernesPago+"T12:00:00").toLocaleDateString("es-MX",{day:"numeric",month:"short"})}
-                              {Number(t.pago_pendiente)>0 && <span style={{color:C.gold}}> (manual)</span>}
-                            </div>
-                          </div>
-                        </div>
-                        <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.red}}>
-                          {peso(t.pagoMensual)}
-                        </span>
+                    <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+                      <span style={{fontSize:12}}>Hipoteca</span>
+                      <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.orange}}>{peso(hipSemanal)}</span>
+                    </div>
+
+                    {tdcItems.map(x => (
+                      <div key={x.tarjeta.id} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+                        <span style={{fontSize:12}}>{x.tarjeta.emoji} {x.tarjeta.nombre} (&divide;4)</span>
+                        <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.red}}>{peso(x.montoSemanal)}</span>
                       </div>
                     ))}
-
-                    {recSemana.map(r => {
-                      const tdc = tarjetas.find(x => x.id === r.tarjeta_id);
-                      return (
-                        <div key={r.id} style={{display:"flex",justifyContent:"space-between",
-                          alignItems:"center",padding:"7px 10px",background:C.s2,borderRadius:8,
-                          marginBottom:4}}>
-                          <div style={{flex:1}}>
-                            <div style={{fontSize:12,fontWeight:500}}>{r.nombre}</div>
-                            <div style={{fontSize:10,color:C.muted}}>
-                              D&iacute;a {r.dia_cargo} &middot; {tdc?tdc.nombre:""}
-                            </div>
-                          </div>
-                          <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.orange,marginRight:6}}>
-                            {peso(r.monto)}
-                          </span>
-                          <button onClick={()=>setEditRecurrente(r)}
-                            style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,padding:"2px"}}>&#9998;</button>
-                          <button onClick={()=>eliminarRecurrente(r.id)}
-                            style={{background:"none",border:"none",color:C.red,cursor:"pointer",fontSize:12,padding:"2px"}}>&#10005;</button>
-                        </div>
-                      );
-                    })}
 
                     {gpSemana.map(g => {
                       const catInfo = CATEGORIAS_GASTO.find(c=>c.id===g.categoria);
@@ -1928,11 +1951,10 @@ export default function App() {
                       );
                     })}
 
-                    {pagosTDC.length===0 && recSemana.length===0 && gpSemana.length===0 && (
-                      <div style={{textAlign:"center",padding:8,color:C.muted,fontSize:12}}>
-                        Sin eventos esta semana
-                      </div>
-                    )}
+                    <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+                      <span style={{fontSize:12,color:C.purple}}>D&iacute;a a d&iacute;a</span>
+                      <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.purple}}>{peso(diaADia)}</span>
+                    </div>
                   </Card>
                 );
               });
@@ -1946,7 +1968,7 @@ export default function App() {
           onSave={guardarSemana} onClose={()=>setEditSemana(null)}
           tarjetas={tarjetas} recurrentes={recurrentes} msiList={msiList}
           gastosPlaneados={gastosPlaneados} cuentas={cuentas} deudas={deudas}
-          onAddMsi={agregarMsi}/>
+          onAddMsi={agregarMsi} config={config}/>
       )}
       {showAddPlaneado && (
         <AddGastoPlaneado onAdd={agregarGastoPlaneado} onClose={()=>setShowAddPlaneado(false)}/>
