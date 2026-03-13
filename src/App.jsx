@@ -95,6 +95,48 @@ function diasHasta(dia) {
   return Math.ceil((f - hoy) / 86400000);
 }
 
+// Devuelve el viernes en/antes de una fecha dada
+function viernesAntesDe(date) {
+  const d = new Date(date);
+  const dow = d.getDay(); // 0=dom...5=vie,6=sab
+  const diff = dow >= 5 ? dow - 5 : dow + 2;
+  d.setDate(d.getDate() - diff);
+  return d;
+}
+
+// Calcula semanas restantes y posicion en ciclo para una TDC
+function calcCicloTDC(fechaPago, fechaCorte, weekStartStr) {
+  const ws = new Date(weekStartStr + "T12:00:00");
+  const yy = ws.getFullYear(), mm = ws.getMonth();
+
+  // Buscar proximo viernes de pago
+  let pagoDate = new Date(yy, mm, fechaPago, 12);
+  let payFri = viernesAntesDe(pagoDate);
+  if (payFri < ws) {
+    pagoDate = new Date(yy, mm + 1, fechaPago, 12);
+    payFri = viernesAntesDe(pagoDate);
+  }
+
+  // Semanas restantes (incluye la semana actual)
+  const semanasRestantes = Math.max(1, Math.floor((payFri - ws) / (7 * 86400000)) + 1);
+
+  // Inicio de ciclo: dia despues del corte, en el mes correcto
+  const fc = fechaCorte || 13;
+  let cStart;
+  if (fc < fechaPago) {
+    cStart = new Date(pagoDate.getFullYear(), pagoDate.getMonth(), fc + 1, 12);
+  } else {
+    cStart = new Date(pagoDate.getFullYear(), pagoDate.getMonth() - 1, fc + 1, 12);
+  }
+
+  // Total semanas en el ciclo
+  const totalDays = Math.floor((payFri - cStart) / 86400000);
+  const totalSemanas = Math.max(1, Math.ceil(totalDays / 7));
+  const semanaActual = Math.max(1, totalSemanas - semanasRestantes + 1);
+
+  return { semanasRestantes, semanaActual, totalSemanas, payFri };
+}
+
 // Dado un dia de pago (ej. 30) y el inicio de semana (viernes),
 // devuelve la fecha ISO del viernes en/antes del pago si cae en esa semana, o null.
 function viernesDePago(diaPago, weekStartStr) {
@@ -150,7 +192,7 @@ function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiLis
   // 2. Hipoteca semanal — apartado fijo cada semana
   const apartadoHipoteca = { monto: hipSemanal };
 
-  // 3. TDC semanal — cada tarjeta ÷ 4
+  // 3. TDC semanal — cada tarjeta ÷ semanas restantes hasta viernes de pago
   const apartadosTDC = tarjetas.map(t => {
     const recMes = recurrentes
       .filter(r => r.tarjeta_id === t.id && r.activo !== false)
@@ -160,20 +202,15 @@ function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiLis
       .reduce((sum, m) => sum + Number(m.mensualidad), 0);
     const autoCalc = recMes + msiMes;
     const montoMensual = Number(t.pago_pendiente) > 0 ? Number(t.pago_pendiente) : autoCalc;
-    const montoSemanal = Math.round(montoMensual / 4);
 
-    // Ciclo informativo (sem X/4)
-    const diaCorte = t.fecha_corte || 13;
-    const hoy = new Date(semanaLunes + "T12:00:00");
-    const y = hoy.getFullYear(), m2 = hoy.getMonth();
-    let cycleStart = new Date(y, m2, diaCorte + 1, 12);
-    if (cycleStart > hoy) cycleStart = new Date(y, m2 - 1, diaCorte + 1, 12);
-    const daysElapsed = Math.floor((hoy - cycleStart) / 86400000);
-    const semanaActual = Math.max(1, Math.min(4, Math.floor(daysElapsed / 7) + 1));
+    // Calcular semanas restantes reales hasta el viernes de pago
+    const ciclo = calcCicloTDC(t.fecha_pago, t.fecha_corte, semanaLunes);
+    const montoSemanal = Math.round(montoMensual / ciclo.semanasRestantes);
 
     return {
       tarjeta: t, montoMensual, montoSemanal,
-      semanaActual, totalSemanas: 4,
+      semanaActual: ciclo.semanaActual, totalSemanas: ciclo.totalSemanas,
+      semanasRestantes: ciclo.semanasRestantes,
       detalle: { recurrentes: recMes, msi: msiMes, manual: Number(t.pago_pendiente) > 0 },
     };
   }).filter(a => a.montoMensual > 0);
@@ -578,8 +615,8 @@ function RecommendationPanel({rec}) {
             monto={a.montoSemanal} color={C.red} />
           <div style={{fontSize:10,color:C.muted,marginBottom:4,paddingLeft:12}}>
             {a.detalle.manual
-              ? <span style={{color:C.gold}}>Manual ({peso(a.montoMensual)}/mes)</span>
-              : <>Rec: {peso(a.detalle.recurrentes)} + MSI: {peso(a.detalle.msi)} = {peso(a.montoMensual)}/mes</>
+              ? <span style={{color:C.gold}}>Manual ({peso(a.montoMensual)} &divide; {a.semanasRestantes} sem)</span>
+              : <>{peso(a.montoMensual)}/mes &divide; {a.semanasRestantes} sem</>
             }
           </div>
         </div>
@@ -1872,7 +1909,7 @@ export default function App() {
               const diaADia = config.presupuesto_dia_a_dia || 4000;
 
               return weeks.map((w, wi) => {
-                // TDC semanal (÷4 cada tarjeta, misma logica para todas las semanas)
+                // TDC semanal — semanas restantes reales hasta viernes de pago
                 const tdcItems = tarjetas.map(t => {
                   const recMes = recurrentes.filter(r => r.tarjeta_id === t.id && r.activo !== false)
                     .reduce((sum, r) => sum + Number(r.monto), 0);
@@ -1880,7 +1917,8 @@ export default function App() {
                     .reduce((sum, m) => sum + Number(m.mensualidad), 0);
                   const autoCalc = recMes + msiMes;
                   const montoMensual = Number(t.pago_pendiente) > 0 ? Number(t.pago_pendiente) : autoCalc;
-                  return { tarjeta: t, montoMensual, montoSemanal: Math.round(montoMensual / 4) };
+                  const ciclo = calcCicloTDC(t.fecha_pago, t.fecha_corte, w.lunes);
+                  return { tarjeta: t, montoMensual, montoSemanal: Math.round(montoMensual / ciclo.semanasRestantes), semanasRestantes: ciclo.semanasRestantes };
                 }).filter(x => x.montoMensual > 0);
 
                 // Gastos planeados de esta semana
@@ -1919,7 +1957,7 @@ export default function App() {
 
                     {tdcItems.map(x => (
                       <div key={x.tarjeta.id} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
-                        <span style={{fontSize:12}}>{x.tarjeta.emoji} {x.tarjeta.nombre} (&divide;4)</span>
+                        <span style={{fontSize:12}}>{x.tarjeta.emoji} {x.tarjeta.nombre} (&divide;{x.semanasRestantes})</span>
                         <span style={{fontFamily:"monospace",fontWeight:700,fontSize:12,color:C.red}}>{peso(x.montoSemanal)}</span>
                       </div>
                     ))}
