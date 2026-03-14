@@ -169,7 +169,7 @@ function calcSemana(s, prevSaldo) {
 }
 
 // --- Motor de Recomendacion (Envelope Waterfall) ---
-function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas, config }) {
+function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas, config, banorteDescontado }) {
   const cfg = config || {};
   const hipSemanal = cfg.hip_semanal || 4037;
   const presupuestoDiaADia = cfg.presupuesto_dia_a_dia || 4000;
@@ -184,9 +184,11 @@ function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiLis
     dias.push(d.getDate());
   }
 
-  // 1. Pre-deducciones (ya descontadas del cheque)
+  // 1. Pre-deducciones — solo restar lo que NO viene ya descontado del cheque
   const suraAplica = semanaLunes <= P.sura_fin;
-  const preDeducciones = P.banorte_semanal + (suraAplica ? P.sura_semanal : 0);
+  const descBanorte = banorteDescontado ? 0 : P.banorte_semanal;
+  const descSura = suraAplica ? P.sura_semanal : 0;
+  const preDeducciones = descBanorte + descSura;
   const ingresoNeto = ingreso - preDeducciones;
 
   // 2. Hipoteca semanal — apartado fijo cada semana
@@ -257,6 +259,7 @@ function calcRecomendacion({ ingreso, semanaLunes, tarjetas, recurrentes, msiLis
 
   return {
     ingresoNeto,
+    descBanorte, descSura,
     apartadoHipoteca,
     apartadosTDC,
     gpSemana,
@@ -603,9 +606,13 @@ function RecommendationPanel({rec}) {
         textTransform:"uppercase",letterSpacing:.5}}>DISTRIBUCI&Oacute;N SEMANAL</div>
 
       <Row label="Tu ingreso neto" monto={rec.ingresoNeto} color={C.green} bold />
-      <div style={{fontSize:10,color:C.muted,marginBottom:10,marginTop:-2}}>
-        Banorte y Sura ya descontados
-      </div>
+      {(rec.descBanorte > 0 || rec.descSura > 0) && (
+        <div style={{fontSize:10,color:C.muted,marginBottom:10,marginTop:-2}}>
+          {[rec.descBanorte > 0 && `Banorte (${peso(rec.descBanorte)})`,
+            rec.descSura > 0 && `Sura (${peso(rec.descSura)})`]
+            .filter(Boolean).join(" y ")} ya descontados
+        </div>
+      )}
 
       <div style={{fontSize:10,color:C.orange,fontWeight:700,marginBottom:6}}>COMPROMISOS FIJOS</div>
       <Row label="Hipoteca" monto={rec.apartadoHipoteca.monto} color={C.orange} />
@@ -742,6 +749,7 @@ function ModalSemana({semana, prevSaldo, onSave, onClose, tarjetas, recurrentes,
   const rec = calcRecomendacion({
     ingreso, semanaLunes: semana.lunes,
     tarjetas, recurrentes, msiList, gastosPlaneados, cuentas, deudas, config,
+    banorteDescontado: banorteDesc,
   });
 
   const guardar = () => onSave({
