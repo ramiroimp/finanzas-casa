@@ -6,7 +6,9 @@ Cuando el usuario paga una TDC, debe hacer dos pasos manuales desconectados: aju
 
 ## Solución
 
-Agregar un botón **"Abonar"** en la vista expandida de cada tarjeta que ejecuta 3 operaciones atómicas: descuenta de una cuenta bancaria, registra un movimiento tipo `pago_tdc`, y reduce el `pago_pendiente` de la tarjeta. La tarjeta muestra un historial de abonos del ciclo actual.
+Agregar un botón **"Abonar"** en la vista expandida de cada tarjeta que ejecuta 3 operaciones secuenciales: descuenta de una cuenta bancaria, registra un movimiento tipo `pago_tdc`, y reduce el `pago_pendiente` de la tarjeta. La tarjeta muestra un historial de abonos del ciclo actual.
+
+Las 3 operaciones NO son atómicas (son llamadas Supabase independientes). Si alguna falla, se muestra un alert con el error y se revierte el estado local optimista. No se usa RPC/transacción para mantener la simplicidad del proyecto (single-file app sin backend propio).
 
 ## Filosofía
 
@@ -23,16 +25,17 @@ ALTER TABLE movimientos ADD COLUMN IF NOT EXISTS tarjeta_id text;
 - Nullable — solo se usa para movimientos de tipo `pago_tdc`
 - Referencia al `id` de la tarjeta pagada
 - No se agrega FK formal para mantener simplicidad
+- `cuenta_destino` ya es nullable en la tabla existente
 
 ### Campos del movimiento `pago_tdc`
 
 | Campo | Valor |
 |---|---|
-| `id` | UUID generado con `uid()` |
+| `id` | ID corto generado con `uid()` (7 chars alfanuméricos, patrón existente en el proyecto) |
 | `fecha` | Fecha actual ISO `YYYY-MM-DD` |
 | `tipo` | `"pago_tdc"` |
 | `cuenta_origen` | ID de la cuenta desde donde se paga |
-| `cuenta_destino` | `null` |
+| `cuenta_destino` | se omite del insert (nullable, no aplica para pagos TDC) |
 | `tarjeta_id` | ID de la tarjeta pagada |
 | `monto` | Cantidad pagada |
 | `descripcion` | `"Pago {nombre_tarjeta} desde {nombre_cuenta}"` |
@@ -41,20 +44,34 @@ ALTER TABLE movimientos ADD COLUMN IF NOT EXISTS tarjeta_id text;
 
 Se reutiliza `movimientos` (ya existe) y `pago_pendiente` (ya existe en `tarjetas`).
 
+## Migración
+
+La migración SQL (`ALTER TABLE`) debe ejecutarse manualmente en el SQL Editor de Supabase **antes** de deployar el código. Misma mecánica que migraciones anteriores (v4, v5).
+
 ## Flujo de usuario
 
-1. Usuario abre el tab **Deudas** y expande una tarjeta
+1. Usuario abre el tab **TDC** y expande una tarjeta
 2. Toca botón **"Abonar"**
 3. Aparece formulario inline (no modal) debajo del botón:
-   - **Dropdown "De"**: cuentas bancarias con saldo visible (excluye cubetas)
+   - **Dropdown "De"**: cuentas bancarias con saldo visible, filtradas por `c.tipo !== "cubeta"` (excluye cubetas)
    - **Monto**: pre-llenado con `pago_pendiente` actual, editable
-   - **Texto informativo**: "Pago total — se marcará como saldada" o "Pago parcial — quedarán $X pendientes"
+   - **Texto informativo**:
+     - Si monto === pendiente: *"Pago total — se marcará como saldada"*
+     - Si monto < pendiente: *"Pago parcial — quedarán $X pendientes"*
+     - Si monto > pendiente: *"Sobrepago — el excedente de $X no se registra como crédito"*
    - **Botones**: "Registrar pago" (dorado) + "Cancelar"
-4. Al confirmar, se ejecutan 3 operaciones:
-   - `updateSaldoCuenta(cuentaId, saldoActual - monto)`
-   - `insertMovimiento({id, fecha, tipo: "pago_tdc", cuenta_origen, tarjeta_id, monto, descripcion})`
-   - `upsertTarjeta({...tarjeta, pago_pendiente: Math.max(0, pendienteActual - monto)})`
-5. UI se actualiza inmediatamente (estados locales + Supabase)
+4. Al confirmar, se ejecutan 3 operaciones secuenciales con manejo de error:
+   ```js
+   try {
+     // 1. Actualizar estado local optimista
+       // 2. updateSaldoCuenta(cuentaId, saldoActual - monto) — verificar error
+     // 3. insertMovimiento({...}) — verificar error
+     // 4. upsertTarjeta({...pago_pendiente: Math.max(0, pendiente - monto)}) — verificar error
+   } catch (e) {
+     // Revertir estado local, mostrar alert("Error al registrar pago")
+   }
+   ```
+5. UI se actualiza inmediatamente (optimista), se revierte si falla
 
 ## Validaciones
 
@@ -76,19 +93,61 @@ Abonos este ciclo
 
 ### Cálculo del ciclo actual
 
-El ciclo de facturación va de `fecha_corte + 1` (mes anterior) a `fecha_corte` (mes actual). Los abonos se filtran client-side de los movimientos ya cargados:
+El ciclo de facturación va de `fecha_corte + 1` (mes anterior) a `fecha_corte` (mes actual). `fecha_corte` es un entero (día del mes). Para derivar las fechas ISO del ciclo:
 
 ```js
-const abonosCiclo = movimientos
-  .filter(m => m.tipo === "pago_tdc" && m.tarjeta_id === tarjeta.id)
-  .filter(m => m.fecha > fechaInicioCorte && m.fecha <= fechaFinCorte);
+function cicloActualTDC(fechaCorte) {
+  const hoy = new Date();
+  const y = hoy.getFullYear(), m = hoy.getMonth();
+  // Si hoy <= fecha_corte, el ciclo empezó el mes pasado y termina este mes
+  // Si hoy > fecha_corte, el ciclo empezó este mes y termina el próximo
+  let inicioAnio, inicioMes, finAnio, finMes;
+  if (hoy.getDate() <= fechaCorte) {
+    inicioMes = m - 1; inicioAnio = y;
+    if (inicioMes < 0) { inicioMes = 11; inicioAnio--; }
+    finMes = m; finAnio = y;
+  } else {
+    inicioMes = m; inicioAnio = y;
+    finMes = m + 1; finAnio = y;
+    if (finMes > 11) { finMes = 0; finAnio++; }
+  }
+  const inicio = new Date(inicioAnio, inicioMes, fechaCorte + 1).toISOString().slice(0,10);
+  const fin = new Date(finAnio, finMes, fechaCorte).toISOString().slice(0,10);
+  return { inicio, fin };
+}
 ```
 
-Se usa la lista de movimientos existente (últimos 50, ya cargados en `useEffect`). 50 es suficiente para cubrir 1-2 ciclos.
+Los abonos se consultan con un query dedicado filtrado por `tipo = 'pago_tdc'` y `tarjeta_id`, sin depender del límite de 50 movimientos generales:
+
+```js
+// Nueva función en supabase.js
+export async function loadAbonosTDC(tarjetaId, fechaInicio, fechaFin) {
+  const { data, error } = await supabase
+    .from("movimientos")
+    .select("*")
+    .eq("tipo", "pago_tdc")
+    .eq("tarjeta_id", tarjetaId)
+    .gte("fecha", fechaInicio)
+    .lte("fecha", fechaFin)
+    .order("fecha", { ascending: true });
+  if (error) { console.error("loadAbonosTDC error:", error); return []; }
+  return data || [];
+}
+```
+
+Esto evita que el límite de 50 movimientos generales oculte abonos en escenarios de pagos parciales frecuentes.
 
 ### Si no hay abonos
 
 No se muestra la sección "Abonos este ciclo".
+
+## Manejo de errores
+
+Las funciones existentes (`updateSaldoCuenta`, `insertMovimiento`, `upsertTarjeta`) hacen `console.error` pero no lanzan excepciones ni retornan el error. Para este flujo, se crean variantes que retornan `{ error }` o se modifica el handler de pago para llamar directo a `supabase.from(...)` con verificación de `error`. Si cualquier paso falla:
+
+1. Se revierte el estado local (cuentas, tarjetas) al snapshot previo
+2. Se muestra `alert("Error al registrar el pago. Verifica tu conexión.")`
+3. No se intenta rollback en Supabase (el usuario puede corregir manualmente si hay inconsistencia parcial — escenario muy raro)
 
 ## Interacción con el motor de recomendación
 
@@ -102,7 +161,7 @@ Si es pago parcial, el `pago_pendiente` reducido se usa como nuevo monto mensual
 
 ## UI — Ubicación del botón "Abonar"
 
-En la vista expandida de cada tarjeta, después de la sección de `pago_pendiente` y antes de la lista de recurrentes:
+En la vista expandida de cada tarjeta (tab TDC), después de la sección de `pago_pendiente` y antes de la lista de recurrentes:
 
 ```
 Pago pendiente del corte: $8,642  [Limpiar]
@@ -117,22 +176,22 @@ Recurrentes que se cargan:
   ...
 ```
 
-## Supabase functions nuevas
+## Supabase functions
 
 ```js
-// En supabase.js — NO se agrega función nueva
+// Nueva en supabase.js:
+export async function loadAbonosTDC(tarjetaId, fechaInicio, fechaFin) { ... }
+
 // Se reutiliza insertMovimiento existente, solo con tipo "pago_tdc" y tarjeta_id
 ```
-
-No se necesita `loadMovimientos` nuevo — la función actual ya carga los últimos 50 movimientos que incluirán los de tipo `pago_tdc`.
 
 ## Componentes afectados
 
 | Componente | Cambio |
 |---|---|
-| Vista expandida de tarjeta (~línea 1649) | Agregar botón "Abonar", formulario inline, historial de abonos |
-| `App()` estado | Ninguno — `movimientos` ya se cargan |
-| `supabase.js` | Ninguno — se reutiliza `insertMovimiento` |
+| Vista expandida de tarjeta (tab TDC) | Agregar botón "Abonar", formulario inline, historial de abonos |
+| `App()` estado | Agregar estado para abonos por tarjeta, cargar con `loadAbonosTDC` |
+| `supabase.js` | Agregar `loadAbonosTDC` |
 | Migración SQL | Un `ALTER TABLE` para agregar `tarjeta_id` |
 
 ## Fuera de alcance
@@ -140,3 +199,4 @@ No se necesita `loadMovimientos` nuevo — la función actual ya carga los últi
 - Automatización de gastos vía email (proyecto separado)
 - Reset automático de `pago_pendiente` al inicio de nuevo ciclo (manual por ahora)
 - Notificaciones de pago
+- Transacciones atómicas vía RPC (no justificado para este proyecto)
