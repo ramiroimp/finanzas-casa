@@ -242,3 +242,18 @@ export async function saveConfig(clave, valor) {
   );
   if (error) console.error("saveConfig error:", error);
 }
+
+// --- Abonos TDC ---
+
+export async function loadAbonosTDC(tarjetaId, fechaInicio, fechaFin) {
+  const { data, error } = await supabase
+    .from("movimientos")
+    .select("*")
+    .eq("tipo", "pago_tdc")
+    .eq("tarjeta_id", tarjetaId)
+    .gte("fecha", fechaInicio)
+    .lte("fecha", fechaFin)
+    .order("fecha", { ascending: true });
+  if (error) { console.error("loadAbonosTDC error:", error); return []; }
+  return data || [];
+}

@@ -24,6 +24,8 @@ import {
   insertMovimiento,
   loadConfig,
   saveConfig,
+  loadAbonosTDC,
+  supabase,
 } from "./supabase";
 
 const P = {
@@ -67,6 +69,24 @@ const CATS = [
 const peso = (n) => n == null ? "\u2014" :
   new Intl.NumberFormat("es-MX",{style:"currency",currency:"MXN",maximumFractionDigits:0}).format(n);
 const uid = () => Math.random().toString(36).slice(2,9);
+
+function cicloActualTDC(fechaCorte) {
+  const hoy = new Date();
+  const y = hoy.getFullYear(), m = hoy.getMonth();
+  let inicioAnio, inicioMes, finAnio, finMes;
+  if (hoy.getDate() <= fechaCorte) {
+    inicioMes = m - 1; inicioAnio = y;
+    if (inicioMes < 0) { inicioMes = 11; inicioAnio--; }
+    finMes = m; finAnio = y;
+  } else {
+    inicioMes = m; inicioAnio = y;
+    finMes = m + 1; finAnio = y;
+    if (finMes > 11) { finMes = 0; finAnio++; }
+  }
+  const inicio = new Date(inicioAnio, inicioMes, fechaCorte + 1, 12).toISOString().slice(0,10);
+  const fin = new Date(finAnio, finMes, fechaCorte, 12).toISOString().slice(0,10);
+  return { inicio, fin };
+}
 
 function getWeekStartOf(d = new Date()) {
   // Semana empieza en viernes (dia de pago)
@@ -1129,6 +1149,8 @@ export default function App() {
   const [editTDCSaldo, setEditTDCSaldo] = useState(null);
   const [editRecurrente, setEditRecurrente] = useState(null);
   const [config, setConfig] = useState({ hip_semanal: 4037, presupuesto_dia_a_dia: 4000 });
+  const [abonosPorTDC, setAbonosPorTDC] = useState({});
+  const [abonarForm, setAbonarForm] = useState(null);
 
   // Legacy cubetas state for fallback
   const [cubetasLegacy, setCubetasLegacy] = useState(null);
@@ -1144,6 +1166,15 @@ export default function App() {
       if(cubLegacy) setCubetasLegacy(cubLegacy);
       if(d) setDeudas(d);
       setTarjetas(t||[]);
+      // Load abonos for each tarjeta
+      if (t && t.length > 0) {
+        const abonosResult = {};
+        for (const tj of t) {
+          const ciclo = cicloActualTDC(tj.fecha_corte);
+          abonosResult[tj.id] = await loadAbonosTDC(tj.id, ciclo.inicio, ciclo.fin);
+        }
+        setAbonosPorTDC(abonosResult);
+      }
       setRecurrentes(r||[]);
       setMsiList(m||[]);
       setGastosPlaneados(gp||[]);
@@ -1230,6 +1261,47 @@ export default function App() {
     const updated = { ...t, pago_pendiente: Number(monto) || 0 };
     setTarjetas(prev => prev.map(x => x.id === id ? updated : x));
     await upsertTarjeta(updated);
+  };
+
+  const registrarPagoTDC = async (tarjetaId, cuentaId, monto) => {
+    const t = tarjetas.find(x => x.id === tarjetaId);
+    const cta = cuentas.find(x => x.id === cuentaId);
+    if (!t || !cta || monto <= 0 || monto > cta.saldo) return;
+
+    const prevCuentas = [...cuentas];
+    const prevTarjetas = [...tarjetas];
+    const nuevoSaldo = cta.saldo - monto;
+    const nuevoPendiente = Math.max(0, Number(t.pago_pendiente) - monto);
+
+    setCuentas(prev => prev.map(c => c.id === cuentaId ? {...c, saldo: nuevoSaldo} : c));
+    setTarjetas(prev => prev.map(x => x.id === tarjetaId ? {...x, pago_pendiente: nuevoPendiente} : x));
+
+    try {
+      const { error: e1 } = await supabase.from("cuentas").update({ saldo: nuevoSaldo }).eq("id", cuentaId);
+      if (e1) throw e1;
+
+      const mov = {
+        id: uid(), fecha: new Date().toISOString().slice(0,10),
+        tipo: "pago_tdc", cuenta_origen: cuentaId, tarjeta_id: tarjetaId,
+        monto, descripcion: `Pago ${t.nombre} desde ${cta.nombre}`,
+      };
+      const { error: e2 } = await supabase.from("movimientos").insert(mov);
+      if (e2) throw e2;
+
+      const { error: e3 } = await supabase.from("tarjetas").upsert(
+        { ...t, pago_pendiente: nuevoPendiente }, { onConflict: "id" }
+      );
+      if (e3) throw e3;
+
+      const ciclo = cicloActualTDC(t.fecha_corte);
+      const abonos = await loadAbonosTDC(tarjetaId, ciclo.inicio, ciclo.fin);
+      setAbonosPorTDC(prev => ({ ...prev, [tarjetaId]: abonos }));
+    } catch (err) {
+      console.error("registrarPagoTDC error:", err);
+      setCuentas(prevCuentas);
+      setTarjetas(prevTarjetas);
+      alert("Error al registrar el pago. Verifica tu conexión.");
+    }
   };
 
   const agregarGastoPlaneado = async (g) => {
@@ -1758,6 +1830,120 @@ export default function App() {
                           }
                         </div>
                       </div>
+
+                      {/* Abonar TDC + Historial */}
+                      {(() => {
+                        const pendiente = Number(t.pago_pendiente) || 0;
+                        const abonos = abonosPorTDC[t.id] || [];
+                        const totalAbonado = abonos.reduce((a, x) => a + Number(x.monto), 0);
+                        const isOpen = abonarForm && abonarForm.tarjetaId === t.id;
+                        const ctasBancarias = cuentas.filter(c => c.tipo !== "cubeta");
+                        const montoNum = isOpen ? (Number(abonarForm.monto) || 0) : 0;
+                        const ctaSel = isOpen ? cuentas.find(c => c.id === abonarForm.cuenta) : null;
+                        const valid = isOpen && montoNum > 0 && ctaSel && montoNum <= ctaSel.saldo;
+                        const textoInfo = isOpen && montoNum > 0 && pendiente > 0
+                          ? montoNum === pendiente ? "Pago total \u2014 se marcar\u00e1 como saldada"
+                          : montoNum < pendiente ? `Pago parcial \u2014 quedar\u00e1n ${peso(pendiente - montoNum)} pendientes`
+                          : `Sobrepago \u2014 el excedente de ${peso(montoNum - pendiente)} no se registra como cr\u00e9dito`
+                          : "";
+                        return (<div style={{marginBottom:16}}>
+                          {!isOpen ? (
+                            <button onClick={(e)=>{e.stopPropagation();
+                              setAbonarForm({tarjetaId:t.id,cuenta:"",monto:pendiente})}}
+                              style={{width:"100%",padding:"10px 0",background:`${C.gold}22`,
+                                border:`1px solid ${C.gold}44`,borderRadius:10,color:C.gold,
+                                fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>
+                              &#x1F4B3; Abonar a esta tarjeta
+                            </button>
+                          ) : (
+                            <div style={{background:C.s2,borderRadius:10,padding:14,
+                              border:`1px solid ${C.border}`}}>
+                              <div style={{fontSize:11,color:C.green,fontWeight:700,marginBottom:10,
+                                textTransform:"uppercase",letterSpacing:.5}}>Registrar pago</div>
+                              <div style={{marginBottom:10}}>
+                                <div style={{fontSize:10,color:C.muted,marginBottom:4}}>De:</div>
+                                <select value={abonarForm.cuenta}
+                                  onChange={e=>setAbonarForm(p=>({...p,cuenta:e.target.value}))}
+                                  style={{width:"100%",padding:"8px 10px",background:C.surface,
+                                    border:`1px solid ${C.border}`,borderRadius:8,color:C.text,
+                                    fontSize:13,fontFamily:"inherit",outline:"none"}}>
+                                  <option value="">Seleccionar cuenta...</option>
+                                  {ctasBancarias.map(c=>(
+                                    <option key={c.id} value={c.id}>
+                                      {c.nombre} ({peso(c.saldo)})
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                              <div style={{marginBottom:10}}>
+                                <div style={{fontSize:10,color:C.muted,marginBottom:4}}>Monto:</div>
+                                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                                  <span style={{fontSize:12,color:C.muted}}>$</span>
+                                  <input type="number" value={abonarForm.monto}
+                                    onChange={e=>setAbonarForm(p=>({...p,monto:e.target.value}))}
+                                    style={{flex:1,background:C.surface,border:`1px solid ${C.border}`,
+                                      borderRadius:8,padding:"8px 10px",color:C.goldL,fontFamily:"monospace",
+                                      fontSize:15,fontWeight:700,outline:"none"}}/>
+                                </div>
+                              </div>
+                              {textoInfo && (
+                                <div style={{fontSize:10,color:montoNum>pendiente?C.orange:C.green,
+                                  marginBottom:10,fontStyle:"italic"}}>{textoInfo}</div>
+                              )}
+                              {ctaSel && montoNum > ctaSel.saldo && (
+                                <div style={{fontSize:10,color:C.red,marginBottom:10}}>
+                                  Fondos insuficientes en {ctaSel.nombre}
+                                </div>
+                              )}
+                              <div style={{display:"flex",gap:8}}>
+                                <button disabled={!valid}
+                                  onClick={async(e)=>{e.stopPropagation();
+                                    await registrarPagoTDC(t.id,abonarForm.cuenta,montoNum);
+                                    setAbonarForm(null);}}
+                                  style={{flex:1,padding:"10px 0",
+                                    background:valid?C.gold:`${C.gold}44`,
+                                    border:"none",borderRadius:8,color:valid?C.bg:C.muted,
+                                    fontWeight:700,fontSize:13,cursor:valid?"pointer":"not-allowed",
+                                    fontFamily:"inherit"}}>
+                                  Registrar pago
+                                </button>
+                                <button onClick={(e)=>{e.stopPropagation();setAbonarForm(null)}}
+                                  style={{padding:"10px 16px",background:"none",
+                                    border:`1px solid ${C.border}`,borderRadius:8,color:C.muted,
+                                    fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>
+                                  Cancelar
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                          {abonos.length > 0 && (
+                            <div style={{marginTop:10,background:`${C.green}0d`,
+                              border:`1px solid ${C.green}22`,borderRadius:10,padding:12}}>
+                              <div style={{fontSize:11,color:C.green,fontWeight:700,marginBottom:8,
+                                textTransform:"uppercase",letterSpacing:.5}}>Abonos este ciclo</div>
+                              {abonos.map(a => (
+                                <div key={a.id} style={{display:"flex",justifyContent:"space-between",
+                                  padding:"4px 0",fontSize:12}}>
+                                  <span style={{color:C.muted}}>
+                                    {new Date(a.fecha+"T12:00:00").toLocaleDateString("es-MX",
+                                      {day:"numeric",month:"short"})}
+                                    {" "}{(cuentas.find(c=>c.id===a.cuenta_origen)||{}).nombre||""}
+                                  </span>
+                                  <span style={{fontFamily:"monospace",fontWeight:700,color:C.green}}>
+                                    {peso(a.monto)}
+                                  </span>
+                                </div>
+                              ))}
+                              <div style={{borderTop:`1px solid ${C.green}22`,marginTop:6,paddingTop:6,
+                                display:"flex",justifyContent:"space-between",fontSize:12,fontWeight:700}}>
+                                <span style={{color:C.muted}}>Total abonado</span>
+                                <span style={{color:C.green}}>{peso(totalAbonado)}</span>
+                              </div>
+                            </div>
+                          )}
+                        </div>);
+                      })()}
+
                       {recTDC.length > 0 && (
                         <div style={{marginBottom:16}}>
                           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
